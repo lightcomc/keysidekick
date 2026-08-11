@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KeySidekick</title>
+<style>
+{{KEYSIDEKICK_STYLES}}
+</style>
+</head>
+<body>
+{{KEYSIDEKICK_ICONS}}<header class="header">
+  <div class="logo">
+    <h1>KeySidekick</h1>
+    <span>Dedicated keyboard control</span>
+  </div>
+  <div class="status-strip" id="statusStrip" aria-label="KeySidekick status">
+    <div class="status-item" id="statusDevice">
+      <span class="status-dot"></span>
+      <span><small>Keyboard</small><strong id="statusDeviceText">Checking…</strong></span>
+    </div>
+    <div class="status-item">
+      <span><small>Active profile</small><strong id="statusActiveText">—</strong></span>
+    </div>
+    <div class="status-item" id="statusTarget">
+      <span class="status-dot"></span>
+      <span><small>Target app</small><strong id="statusTargetText">Not checked</strong></span>
+    </div>
+  </div>
+</header>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-title">
+      <div><span class="eyebrow">Profiles</span><h2>Your keyboard modes</h2></div>
+      <span class="profile-count" id="profileCount">0</span>
+    </div>
+    <nav class="profile-list" id="profileList" aria-label="Profiles"></nav>
+    <button class="profile-new" type="button" onclick="newProfile()">+ Create profile</button>
+    <div class="sidebar-tools">
+      <button class="btn small primary" type="button" onclick="showWizard()">+ Setup keyboard</button>
+      <button class="btn small" type="button" onclick="showPresetWizard()">+ Pad template</button>
+      <button class="btn small" type="button" onclick="showLive()">Live</button>
+      <button class="btn small" type="button" onclick="showDevices()">Devices</button>
+      <button class="btn small" type="button" onclick="showOnboarding()">Start here</button>
+      <button class="btn small" type="button" onclick="reloadConfig()">Reload from INI</button>
+      <button class="btn small" type="button" onclick="exportConfig()">Export</button>
+      <button class="btn small" type="button" onclick="document.getElementById('importFile').click()">Import</button>
+      <button class="btn small" type="button" onclick="showDiagnostics()">Diagnostics</button>
+      <button class="btn small" type="button" onclick="showHelp()">Help / Setup</button>
+    </div>
+    <div class="sidebar-footer" id="versionFooter" style="margin-top:8px;font-size:12px;color:var(--muted);padding:0 4px"></div>
+  </aside>
+  <main class="main" id="editor">
+    <div class="loading-state"><span class="spinner"></span><p>Loading profiles…</p></div>
+  </main>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+<input type="file" id="importFile" accept=".ini,.txt,text/plain,application/octet-stream" style="display:none" onchange="if(this.files&amp;&amp;this.files[0])importConfigFile(this.files[0]);this.value=''">
+<div id="appModal" style="display:none"></div>
+<script>
+{{KEYSIDEKICK_SCRIPT}}
+</script>
+</body>
+</html>

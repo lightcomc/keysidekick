@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KeySidekick — a spare keyboard as a Windows control deck</title>
+<style>
+:root{--bg:#0f1117;--card:#1a1d27;--card2:#151923;--border:#2a2e3a;--text:#e4e6eb;--muted:#8b8f9a;--accent:#4a9eff;--accent2:#93c5fd;--green:#22c55e;--amber:#f59e0b;--red:#ef4444;--violet:#c4b5fd;--pink:#f9a8d4;--cyan:#7dd3fc;--lime:#86efac}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:radial-gradient(circle at 75% -20%,rgba(74,158,255,.10),transparent 38%),var(--bg);color:var(--text);font-size:15px;line-height:1.6}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+/* Hero */
+.hero{position:relative;padding:90px 0 70px;overflow:hidden}
+.hero .badge{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:650;letter-spacing:.08em;text-transform:uppercase;color:var(--accent2);border:1px solid rgba(74,158,255,.35);background:rgba(74,158,255,.1);border-radius:999px;padding:5px 13px;margin-bottom:20px}
+.hero h1{font-size:clamp(30px,5vw,52px);line-height:1.12;letter-spacing:-.03em;font-weight:750;margin-bottom:16px}
+.hero h1 .grad{background:linear-gradient(90deg,#4a9eff,#a78bfa);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p.lead{font-size:clamp(15px,2vw,19px);color:#c7ccd6;max-width:760px;margin-bottom:26px}
+.hero .cta{display:flex;gap:12px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:11px 20px;border-radius:9px;font-size:14px;font-weight:600;text-decoration:none;transition:all .15s;border:1px solid transparent;cursor:pointer}
+.btn.primary{background:var(--accent);color:#fff}
+.btn.primary:hover{background:#3a8eef}
+.btn.ghost{background:var(--card);border-color:var(--border);color:var(--text)}
+.btn.ghost:hover{border-color:var(--accent);color:var(--accent)}
+.hero-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:44px}
+.stat{background:linear-gradient(145deg,rgba(27,33,48,.96),rgba(21,25,35,.96));border:1px solid var(--border);border-radius:12px;padding:16px 18px}
+.stat b{display:block;font-size:24px;font-weight:750;color:var(--accent2)}
+.stat span{font-size:12px;color:var(--muted)}
+/* Sections */
+section{padding:64px 0;border-top:1px solid var(--border)}
+.eyebrow{display:inline-block;font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--accent);font-weight:700;margin-bottom:10px}
+h2{font-size:clamp(24px,3.5vw,34px);letter-spacing:-.02em;margin-bottom:12px;font-weight:750}
+.sub{color:var(--muted);max-width:720px;margin-bottom:26px;font-size:15px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px}
+.card h3{font-size:15px;margin-bottom:8px;display:flex;align-items:center;gap:9px}
+.card p{font-size:13px;color:var(--muted)}
+.card .pic{font-size:20px}
+code{background:var(--card2);border:1px solid var(--border);padding:1.5px 6px;border-radius:5px;font-size:12.5px;font-family:"Cascadia Mono",Consolas,monospace;color:var(--cyan)}
+pre{background:var(--card2);border:1px solid var(--border);border-radius:9px;padding:16px;font-size:12.5px;overflow-x:auto;font-family:"Cascadia Mono",Consolas,monospace;color:#cbd5e1;line-height:1.6}
+pre code{background:none;border:none;padding:0;color:inherit}
+table{width:100%;border-collapse:collapse;font-size:13px;background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:11px 14px;border-bottom:1px solid var(--border)}
+td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:top}
+tr:last-child td{border-bottom:none}
+.ok{color:var(--green);font-weight:600}.bad{color:var(--red);font-weight:600}.warn{color:var(--amber);font-weight:600}
+.tag{display:inline-block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;padding:2.5px 8px;border-radius:999px;border:1px solid var(--border);color:var(--muted);margin-left:6px;vertical-align:middle}
+.tag.agent{color:var(--cyan);border-color:rgba(125,211,252,.3);background:rgba(125,211,252,.08)}
+.tag.usecase{color:var(--amber);border-color:rgba(245,158,11,.3);background:rgba(245,158,11,.08)}
+/* Presets */
+.preset{display:flex;flex-direction:column;gap:6px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px}
+.preset h4{font-size:14px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.preset p{font-size:12px;color:var(--muted)}
+.kbd{display:inline-block;min-width:26px;text-align:center;font-size:11px;font-weight:650;font-family:monospace;color:var(--cyan);background:var(--card2);border:1px solid var(--border);border-radius:5px;padding:1.5px 5px}
+.preset ul{list-style:none;margin-top:4px;display:flex;flex-direction:column;gap:3px}
+.preset li{font-size:11.5px;color:#aab3c2;display:flex;gap:8px;align-items:baseline}
+/* Flow */
+.flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:22px 0}
+.flow-step{background:var(--card);border:1px solid var(--border);border-radius:11px;padding:16px;text-align:center;position:relative}
+.flow-step .n{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:7px;background:rgba(74,158,255,.14);border:1px solid rgba(74,158,255,.35);color:var(--accent2);font-size:12px;font-weight:750;margin-bottom:8px}
+.flow-step b{display:block;font-size:13px;margin-bottom:3px}
+.flow-step span{font-size:11px;color:var(--muted)}
+.flow-arrow{color:var(--muted);align-self:center;font-size:18px;text-align:center}
+@media (min-width:760px){.flow-arrow{display:none}}
+/* Language switcher */
+.lang-switcher{position:sticky;top:0;z-index:100;display:flex;justify-content:center;gap:6px;padding:10px 0;background:rgba(15,17,23,.9);backdrop-filter:blur(4px);border-bottom:1px solid var(--border)}
+.lang-btn{background:var(--card);border:1px solid var(--border);color:var(--muted);font-size:12px;font-weight:650;padding:5px 14px;border-radius:999px;cursor:pointer;transition:all .15s;font-family:inherit}
+.lang-btn:hover{border-color:var(--accent);color:var(--accent)}
+.lang-btn.active{background:rgba(74,158,255,.15);border-color:rgba(74,158,255,.45);color:var(--accent2)}
+.lang{display:none}
+.lang[data-lang="en"]{display:block}
+/* Footer */
+footer{padding:36px 0 54px;color:var(--muted);font-size:12px;border-top:1px solid var(--border);text-align:center}
+</style>
+</head>
+<body>
+
+<div class="lang-switcher" role="group" aria-label="Language / Язык / 语言">
+  <button class="lang-btn active" data-lang="en" type="button">EN</button>
+  <button class="lang-btn" data-lang="ru" type="button">РУС</button>
+  <button class="lang-btn" data-lang="zh" type="button">中文</button>
+</div>
+
+<div class="lang" lang="en" data-lang="en">
+
+<div class="hero">
+  <div class="wrap">
+    <span class="badge">Windows 10+ · C++11 · GPL-3.0 · dashboard on 127.0.0.1</span>
+    <h1>A spare keyboard becomes a<br>Windows <span class="grad">control deck</span></h1>
+    <p class="lead">KeySidekick detaches a specific USB keyboard from the system keyboard stack (via the WinUSB driver), reads its raw HID reports, and routes every key through the active profile — without stealing focus from the app you're working in. A second keyboard becomes a remote control: for AI agents, media players, a DAW, OBS, calls, presentations.</p>
+    <div class="cta">
+      <a class="btn primary" href="#solution">How it works</a>
+      <a class="btn ghost" href="#features">Features</a>
+      <a class="btn ghost" href="#presets">Pad templates</a>
+      <a class="btn ghost" href="#api">HTTP API</a>
+    </div>
+    <div class="hero-stats">
+      <div class="stat"><b>~5k</b><span>lines in sidekick.cpp</span></div>
+      <div class="stat"><b>0 kB</b><span>of kernel, LL hooks, filter drivers</span></div>
+      <div class="stat"><b>15</b><span>preset templates «key → action»</span></div>
+      <div class="stat"><b>13 unit + 44 integration</b><span>live API checks</span></div>
+    </div>
+  </div>
+</div>
+
+<section id="problem">
+  <div class="wrap">
+    <span class="eyebrow">The problem</span>
+    <h2>Windows can't tell one keyboard from another</h2>
+    <p class="sub">You want a specific keyboard to control a specific app — without its keys reaching the active window, with no lag, and no risk to your system.</p>
+    <table>
+      <tr><th>Approach</th><th>Distinguishes keyboards</th><th>Blocks keys</th><th>Lag / risk</th></tr>
+      <tr><td><code>WH_KEYBOARD_LL</code> hook</td><td class="bad">no — no device ID</td><td class="ok">yes</td><td class="bad">blocks the whole system input thread</td></tr>
+      <tr><td>Raw Input (<code>WM_INPUT</code>)</td><td class="warn">only if <code>hDevice != NULL</code></td><td class="bad">read-only</td><td class="ok">none</td></tr>
+      <tr><td>Interception (kernel filter)</td><td class="ok">yes</td><td class="ok">yes</td><td class="bad">kernel driver, hibernate lockup risk</td></tr>
+      <tr style="background:rgba(74,158,255,.07)"><td><b>WinUSB driver replacement</b></td><td class="ok">yes — reads the device directly</td><td class="ok">yes — keys never enter the input queue</td><td class="ok">no lag, no kernel code</td></tr>
+    </table>
+    <p class="sub" style="margin-top:18px">The trap: cheap / composite keyboards (keyboard + touchpad) report <code>hDevice == NULL</code> even in Raw Input — you can't tell them apart from the main keyboard. KeySidekick doesn't depend on that at all: we read HID directly through WinUSB.</p>
+  </div>
+</section>
+
+<section id="solution">
+  <div class="wrap">
+    <span class="eyebrow">The solution</span>
+    <h2>WinUSB bypass: keys physically never reach the system</h2>
+    <p class="sub">The keyboard interface is switched from <code>hidusb.sys → kbdhid.sys → kbdclass.sys</code> to Microsoft-signed <code>WinUSB.sys</code> — via Zadig. Keys stop entering the Windows input queue entirely, and sidekick.exe reads 8-byte HID reports from an async pipe and dispatches them by profile.</p>
+    <div class="flow">
+      <div class="flow-step"><span class="n">1</span><b>Spare keyboard</b><span>MI_00 switched to WinUSB (Zadig, once)</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step"><span class="n">2</span><b>HID reports</b><span>sidekick.exe reads 8-byte reports from the interrupt-IN pipe</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step"><span class="n">3</span><b>Profile</b><span>active mode: basic / targeted, key mappings</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step"><span class="n">4</span><b>Action</b><span>SendInput, PostMessage to a window, !switch/!launch/!app, macros</span></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><h3><span class="pic">✅</span> What you get</h3><p>No LL hook → no system lag. Works even with <code>hDevice == NULL</code>. No kernel filter — only WHQL-signed WinUSB. Survives hibernate/sleep (WinUSB handles ACPI). The main keyboard is never touched.</p></div>
+      <div class="card"><h3><span class="pic">⚠️</span> What to know</h3><p>Until sidekick.exe is running, the dedicated keyboard won't type — that's expected (auto-start is configured in the dashboard in advance). Basic mode marks events as injected — in anti-cheat games use targeted mode or restore the HID driver.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <span class="eyebrow">Features</span>
+    <h2>Dashboard, profiles, live updates</h2>
+    <p class="sub">Everything is managed from the built-in web dashboard at <code>http://127.0.0.1:8765/</code> — no hand-editing INI files.</p>
+    <div class="grid3">
+      <div class="card"><h3><span class="pic">🔄</span> Profiles and modes</h3><p>Create, rename, duplicate, delete. Two modes: <code>basic</code> — types like a normal keyboard; <code>targeted</code> — sends to an app's window in the background (with hold, auto-repeat, and release).</p></div>
+      <div class="card"><h3><span class="pic">🎯</span> Multi-app routing</h3><p>Within one profile, different keys can target different apps: <code>!app:Spotify:{Media_Play_Pause}</code> — to Spotify, the rest follows the profile.</p></div>
+      <div class="card"><h3><span class="pic">⚡</span> Live + click-to-fire</h3><p>The Live screen shows a grid of the active profile's mappings and a feed of fired actions. Click any cell or any feed hit — the action fires instantly, no physical key needed.</p></div>
+      <div class="card"><h3><span class="pic">⌨️</span> Typed Action Builder</h3><p>Instead of browser <code>prompt()</code> — a modal action editor: Keys/Media/Macros/Switch/Launch/Send-to-app chips, live preview, picking a running window.</p></div>
+      <div class="card"><h3><span class="pic">📦</span> One-click pad templates</h3><p><code>+ Pad template</code> creates a ready F1–F12 profile: AI agents, media, OBS, meetings, PowerPoint, REAPER, DaVinci Resolve, Ableton, Premiere, Lightroom.</p></div>
+      <div class="card"><h3><span class="pic">🎓</span> First-run onboarding</h3><p>An empty dashboard greets you with three paths: «Pad template», «Create profile», «Keyboard setup». The «Start here» button returns to the choice anytime.</p></div>
+      <div class="card"><h3><span class="pic">📡</span> SSE live updates</h3><p>State updates are event-driven (revision + activity), with a 3-second fallback poll if the connection drops. The dashboard never hangs on config reloads.</p></div>
+      <div class="card"><h3><span class="pic">🧭</span> Setup wizard</h3><p>7 steps: from «right now this is an ordinary keyboard» to activation: identify by keypress, preparation (auto-start, fallback input), Zadig guide, WinUSB verification, mode selection.</p></div>
+      <div class="card"><h3><span class="pic">🔧</span> Diagnostics and Help</h3><p>Diagnostics page: device state, pipe, config, log. Help/Setup: driver rollback, wireless keyboards, anti-cheat warning.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="presets">
+  <div class="wrap">
+    <span class="eyebrow">Preset catalog</span>
+    <h2>Pad templates: key → action</h2>
+    <p class="sub">Each template is a ready targeted/basic profile with F1–F12. DAW/video/photo hotkeys verified against official manuals (REAPER User Guide v7.78, DaVinci Resolve 19 Reference, Ableton Live 12 KB, Adobe Premiere Default Shortcuts, Lightroom Classic KB).</p>
+    <div class="grid3">
+      <div class="preset"><h4>AI pad <span class="tag agent">agent</span></h4><p>Codex, ChatGPT, Claude, Cursor, Devin, Copilot</p><ul><li><span class="kbd">F1</span> Accept / Send</li><li><span class="kbd">F2</span> Cancel (Esc)</li><li><span class="kbd">F4</span> Toggle sidebar</li><li><span class="kbd">F6</span> Voice / PTT</li><li><span class="kbd">F11</span> Play / pause media</li></ul></div>
+      <div class="preset"><h4>Media <span class="tag usecase">use-case</span></h4><p>Global media keys (basic)</p><ul><li><span class="kbd">F1</span> Play / pause</li><li><span class="kbd">F2</span> Next track</li><li><span class="kbd">F3</span> Prev track</li><li><span class="kbd">F6</span> Volume −</li><li><span class="kbd">F8</span> Play sup / Space</li></ul></div>
+      <div class="preset"><h4>OBS / Streaming <span class="tag usecase">use-case</span></h4><p>Set the same hotkeys in OBS</p><ul><li><span class="kbd">F1</span> Start / stop recording</li><li><span class="kbd">F2</span> Start / stop streaming</li><li><span class="kbd">F4</span> Mute mic</li><li><span class="kbd">F6</span> Close OBS</li></ul></div>
+      <div class="preset"><h4>Meet / Zoom <span class="tag usecase">use-case</span></h4><p>Calls</p><ul><li><span class="kbd">F1</span> Mic off / on</li><li><span class="kbd">F2</span> Camera off / on</li><li><span class="kbd">F3</span> Raise hand</li><li><span class="kbd">F6</span> Leave call</li></ul></div>
+      <div class="preset"><h4>PowerPoint <span class="tag usecase">use-case</span></h4><p>Presentations</p><ul><li><span class="kbd">F1</span> Start slideshow</li><li><span class="kbd">F3</span> Next slide</li><li><span class="kbd">F6</span> Black screen</li><li><span class="kbd">F8</span> First slide</li></ul></div>
+      <div class="preset"><h4>REAPER DAW <span class="tag usecase">use-case</span></h4><p>Official hotkeys v7.78</p><ul><li><span class="kbd">F1</span> Play / stop</li><li><span class="kbd">F3</span> Record</li><li><span class="kbd">F4</span> Split item</li><li><span class="kbd">F6</span> Rewind</li><li><span class="kbd">F12</span> New track</li></ul></div>
+      <div class="preset"><h4>DaVinci Resolve <span class="tag usecase">use-case</span></h4><p>Resolve 19 hotkeys (media = Shift+2!)</p><ul><li><span class="kbd">F1</span> Play / pause</li><li><span class="kbd">F2</span> Rewind (J)</li><li><span class="kbd">F4</span> Mark in</li><li><span class="kbd">F8</span> Blade edit mode</li><li><span class="kbd">F10</span> Media browser</li></ul></div>
+      <div class="preset"><h4>Ableton Live <span class="tag usecase">use-case</span></h4><p>Official hotkeys 12</p><ul><li><span class="kbd">F1</span> Record (global)</li><li><span class="kbd">F2</span> Play / stop</li><li><span class="kbd">F3</span> Metronome</li><li><span class="kbd">F6</span> Session ↔ Arrangement</li><li><span class="kbd">F11</span> MIDI map mode</li></ul></div>
+      <div class="preset"><h4>Adobe Premiere <span class="tag usecase">use-case</span></h4><p>Premiere Pro defaults</p><ul><li><span class="kbd">F1</span> Play / stop</li><li><span class="kbd">F4</span> Scrub forward</li><li><span class="kbd">F9</span> Ripple delete</li><li><span class="kbd">F10</span> Match frame</li><li><span class="kbd">F12</span> Save project</li></ul></div>
+      <div class="preset"><h4>Lightroom Classic <span class="tag usecase">use-case</span></h4><p>Official LrC hotkeys</p><ul><li><span class="kbd">F1</span> Grid</li><li><span class="kbd">F2</span> Loupe</li><li><span class="kbd">F3</span> Develop</li><li><span class="kbd">F5</span> Flag pick</li><li><span class="kbd">F11</span> Prev photo</li></ul></div>
+    </div>
+  </div>
+</section>
+
+<section id="api">
+  <div class="wrap">
+    <span class="eyebrow">Integration</span>
+    <h2>Local HTTP API (loopback, CSRF-protected)</h2>
+    <p class="sub">All operations are available from <code>127.0.0.1:8765</code>: state, devices, profiles, presets, activity, config export/import. Includes the new <code>POST /api/v1/action/fire</code> endpoint — run an action programmatically, as if a key was pressed.</p>
+<pre><code>curl http://127.0.0.1:8765/api/profiles        # list profiles
+curl http://127.0.0.1:8765/api/v1/state        # unified snapshot
+curl http://127.0.0.1:8765/api/v1/hid          # devices + driver state
+curl http://127.0.0.1:8765/api/v1/presets      # pad-template catalog
+curl http://127.0.0.1:8765/api/v1/activity     # recent fired actions
+
+TOKEN=$(curl -s http://127.0.0.1:8765/ | grep -o 'CSRF_TOKEN="[^"]*"' | grep -o '"[^"]*"' | tr -d '"')
+# fire an action programmatically (Live click-to-fire from outside):
+curl -X POST http://127.0.0.1:8765/api/v1/action/fire \
+  -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" \
+  -d '{"action":"{Media_Play_Pause}","usage":42,"profile":""}'
+# enable the «REAPER DAW» template:
+curl -X POST http://127.0.0.1:8765/api/v1/preset/apply \
+  -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" \
+  -d '{"agentId":"reaper","name":"REAPER pad"}'</code></pre>
+    <div class="grid3">
+      <div class="card"><h3><span class="pic">🔒</span> Security</h3><p>The server listens only on <code>127.0.0.1</code>, requires the <code>X-KeySidekick-Token</code> CSRF token on mutating requests, and checks the loopback Origin. Not reachable from outside.</p></div>
+      <div class="card"><h3><span class="pic">💾</span> Export / import</h3><p>Base64 config: one button — download <code>keysidekick-config.ini</code> + copy the text to the clipboard. Import validates and atomically rewrites the config.</p></div>
+      <div class="card"><h3><span class="pic">🔌</span> SSE + revision</h3><p>Every mutation bumps <code>stateRevision</code> and sends an SSE event — clients stay in sync without polling. The activity feed also arrives over SSE.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <span class="eyebrow">Architecture</span>
+    <h2>What's inside the repo</h2>
+    <div class="grid3">
+      <div class="card"><h3><span class="pic">🧠</span> <code>src/sidekick.cpp</code></h3><p>~5k lines: WinUSB pipe, async HID reading, key-diff, per-profile dispatch, HTTP server on WS2_32, SSE, SSE token, tray, master marshaling of writes into the main thread (WM_DASH_OP).</p></div>
+      <div class="card"><h3><span class="pic">🌐</span> <code>web/</code> dashboard</h3><p>One HTML page: <code>app.js</code> (dashboard + onboarding + Live + preset wizard + action builder) + <code>styles.css</code>. Bundled into <code>dashboard_embedded.generated.h</code> via PowerShell.</p></div>
+      <div class="card"><h3><span class="pic">🧪</span> <code>tests/</code></h3><p>13 unit tests (config bridge, domain, windows_targets) + <code>http_integration_tests.sh</code> — 44 live-API checks: profile creation, mappings, presets, fire-action, export/import, devices.</p></div>
+    </div>
+    <h2 style="font-size:22px;margin-top:34px">Data flow</h2>
+    <pre><code>Spare keyboard (WinUSB)
+   │  HID reports (8 bytes, interrupt IN)
+   ▼
+sidekick.exe ── WinUsb_ReadPipe (async)
+   │  diff key-down / key-up
+   ▼
+active profile (basic / targeted)
+   │
+   ├── basic:      SendInput (re-inject into system input)
+   ├── targeted:   PostMessage(WND, WM_KEYDOWN/UP) to the app window
+   └── action:     !switch / !toggle / !launch / !app / macro sequences
+   │
+   ├── Activity ring (cap 24) → SSE → dashboard Live feed
+   └── BumpRevision() → SSE → dashboard re-render</code></pre>
+  </div>
+</section>
+
+<section id="build">
+  <div class="wrap">
+    <span class="eyebrow">Build and tests</span>
+    <h2>Quick start</h2>
+    <div class="grid2">
+      <div class="card"><h3><span class="pic">🏗️</span> Build (MinGW-w64)</h3>
+<pre><code>cd src
+build.bat
+# g++ -O2 -o sidekick.exe sidekick.cpp
+#   -lsetupapi -lwinusb -luser32 -lws2_32 -lshell32 -lgdi32 -static
+# g++ -O2 -o probe_device.exe probe_device.cpp ...</code></pre>
+        <p>Only MinGW g++ is required; no Windows SDK paths — WinUSB/setupapi headers ship with MinGW. <code>--check-dashboard</code> verifies the embedded dashboard is fresh at build time.</p>
+      </div>
+      <div class="card"><h3><span class="pic">🧪</span> Tests</h3>
+<pre><code>cd tests
+run_all_tests.sh            # unit (13) + config round-trip
+# integration: run sidekick.exe first, then
+http_integration_tests.sh   # 44 live-API checks</code></pre>
+        <p>Unit tests cover config v3 (parsing/serialization), domain bridge, windows_targets resolver. Integration tests hit the real HTTP server: profile CRUD, keys, presets, fire-action, export/import, diagnostics.</p>
+      </div>
+      <div class="card"><h3><span class="pic">🚀</span> First run</h3>
+<pre><code>copy src\config.example.ini src\config.ini
+# DeviceVIDPID=vid_xxxx&amp;pid_yyyy  — your device
+cd src
+run.bat</code></pre>
+        <p>Then: dashboard <code>http://127.0.0.1:8765/</code> → «+ Setup keyboard» (Zadig wizard) → «+ Pad template» or manual profiles.</p>
+      </div>
+      <div class="card"><h3><span class="pic">📚</span> Documentation</h3><p><code>ZADIG_INSTRUCTIONS.md</code> — driver swap and rollback. <code>docs/PROBLEM-AND-SOLUTION.md</code> — the technical rationale (why the LL hook lags, why WinUSB wins). <code>docs/FAQ.md</code>, <code>docs/HID-USAGE-TABLE.md</code> — the Usage ID table for your INI.</p></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    KeySidekick — GPL-3.0 · Windows 10 1809+ · built on WinUSB by Microsoft and Zadig (LGPL) · <a href="#" style="color:var(--accent)">docs in the repository</a>
+  </div>
+</footer>
+
+</div>
+
+<div class="lang" lang="ru" data-lang="ru">
+
+<div class="hero">
+  <div class="wrap">
+    <span class="badge">Windows 10+ · C++11 · GPL-3.0 · dashboard на 127.0.0.1</span>
+    <h1>Запасная клавиатура<br>становится <span class="grad">пультом управления</span> Windows</h1>
+    <p class="lead">KeySidekick отвязывает конкретную USB-клавиатуру от системной клавиатурной стека (WinUSB-драйвер), читает её сырые HID-отчёты и направляет каждую клавишу по активному профилю — не отнимая фокус у приложения, в котором вы работаете. Вторая клавиатура — это пульт: для AI-агентов, медиаплеера, DAW, OBS, созвонов, презентаций.</p>
+    <div class="cta">
+      <a class="btn primary" href="#solution">Как это работает</a>
+      <a class="btn ghost" href="#features">Возможности</a>
+      <a class="btn ghost" href="#presets">Pad-шаблоны</a>
+      <a class="btn ghost" href="#api">HTTP API</a>
+    </div>
+    <div class="hero-stats">
+      <div class="stat"><b>~5k</b><span>строк в sidekick.cpp</span></div>
+      <div class="stat"><b>0 kB</b><span>ядра, LL-хуков, фильтр-драйверов</span></div>
+      <div class="stat"><b>15</b><span>пресетов-шаблонов «клавиша → действие»</span></div>
+      <div class="stat"><b>13 unit + 44 integration</b><span>проверок живого API</span></div>
+    </div>
+  </div>
+</div>
+
+<section id="problem">
+  <div class="wrap">
+    <span class="eyebrow">Проблема</span>
+    <h2>Windows не даёт отличить одну клавиатуру от другой</h2>
+    <p class="sub">Нужно, чтобы конкретная клавиатура управляла конкретным приложением, её нажатия не попадали в активное окно, и всё это — без задержек и без риска для системы.</p>
+    <table>
+      <tr><th>Подход</th><th>Различает клавиатуры</th><th>Блокирует нажатия</th><th>Задержка / риск</th></tr>
+      <tr><td><code>WH_KEYBOARD_LL</code> hook</td><td class="bad">нет — нет ID устройства</td><td class="ok">да</td><td class="bad">блокирует весь системный поток ввода</td></tr>
+      <tr><td>Raw Input (<code>WM_INPUT</code>)</td><td class="warn">только если <code>hDevice != NULL</code></td><td class="bad">read-only</td><td class="ok">нет</td></tr>
+      <tr><td>Interception (kernel filter)</td><td class="ok">да</td><td class="ok">да</td><td class="bad">kernel-драйвер, риск при hibernate</td></tr>
+      <tr style="background:rgba(74,158,255,.07)"><td><b>WinUSB driver replacement</b></td><td class="ok">да — читаем устройство напрямую</td><td class="ok">да — клавиши не попадают в input queue</td><td class="ok">нет lag, нет kernel-кода</td></tr>
+    </table>
+    <p class="sub" style="margin-top:18px">Ловушка: дешёвые / composite-клавиатуры (клавиатура + тачпад) присылают <code>hDevice == NULL</code> даже в Raw Input — их не отличить от основной. KeySidekick не зависит от этого вообще: мы читаем HID напрямую через WinUSB.</p>
+  </div>
+</section>
+
+<section id="solution">
+  <div class="wrap">
+    <span class="eyebrow">Решение</span>
+    <h2>WinUSB bypass: клавиши физически не доходят до системы</h2>
+    <p class="sub">Интерфейс клавиатуры переключается с <code>hidusb.sys → kbdhid.sys → kbdclass.sys</code> на подписанный Microsoft'ом <code>WinUSB.sys</code> — инструментом Zadig. Клавиши перестают входить в очередь ввода Windows вообще, а sidekick.exe читает 8-байтовые HID-отчёты async-пайпа и диспетчеризует их по профилю.</p>
+    <div class="flow">
+      <div class="flow-step"><span class="n">1</span><b>Запасная клавиатура</b><span>MI_00 переведена на WinUSB (Zadig, один раз)</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step"><span class="n">2</span><b>HID-отчёты</b><span>sidekick.exe читает 8-байтовые reports с interrupt-IN pipe</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step"><span class="n">3</span><b>Профиль</b><span>активный режим: basic / targeted, маппинги клавиш</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step"><span class="n">4</span><b>Действие</b><span>SendInput, PostMessage в окно, !switch/!launch/!app, макро</span></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><h3><span class="pic">✅</span> Что это даёт</h3><p>Нет LL-хука → нет лага системы. Работает даже при <code>hDevice == NULL</code>. Нет kernel-фильтра — только WHQL-подписанный WinUSB. Переживает hibernate/sleep (WinUSB держит ACPI). Основная клавиатура не затрагивается вообще.</p></div>
+      <div class="card"><h3><span class="pic">⚠️</span> Что важно знать</h3><p>Пока sidekick.exe не запущен, выделенная клавиатура не печатает — это ожидаемо (auto-start настраивается в дашборде заранее). Basic-режим помечает нажатия как инжектированные — в играх с античитом используйте targeted или верните HID-драйвер.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <span class="eyebrow">Возможности</span>
+    <h2>Дашборд, профили, живые обновления</h2>
+    <p class="sub">Весь функционал управляется из встроенного веб-дашборда на <code>http://127.0.0.1:8765/</code> — без правки INI руками.</p>
+    <div class="grid3">
+      <div class="card"><h3><span class="pic">🔄</span> Профили и режимы</h3><p>Создание, переименование, дублирование, удаление. Два режима: <code>basic</code> — печатает как обычная клавиатура; <code>targeted</code> — шлёт в окно приложения фоном (с удержанием, автоповтором и отпусканием).</p></div>
+      <div class="card"><h3><span class="pic">🎯</span> Multi-app маршрутизация</h3><p>Внутри одного профиля разные клавиши могут целиться в разные приложения: <code>!app:Spotify:{Media_Play_Pause}</code> — в Spotify, остальное — по профилю.</p></div>
+      <div class="card"><h3><span class="pic">⚡</span> Live + click-to-fire</h3><p>Экран Live показывает сетку маппингов активного профиля и ленту сработавших действий. Каждую ячейку и каждый хит ленты можно нажать — действие выполнится сразу, без физической клавиши.</p></div>
+      <div class="card"><h3><span class="pic">⌨️</span> Typed Action Builder</h3><p>Вместо браузерных <code>prompt()</code> — модальный конструктор действия: чипы Keys/Media/Macros/Switch/Launch/Send-to-app, live-превью, выбор запущенного окна.</p></div>
+      <div class="card"><h3><span class="pic">📦</span> Pad-шаблоны в один клик</h3><p><code>+ Pad template</code> создаёт готовый профиль с F1–F12: AI-агенты, медиа, OBS, созвоны, PowerPoint, REAPER, DaVinci Resolve, Ableton, Premiere, Lightroom.</p></div>
+      <div class="card"><h3><span class="pic">🎓</span> First-run onboarding</h3><p>Пустой дашборд встречает тремя путями: «Pad template», «Создать профиль», «Настройка клавиатуры». Кнопка «Start here» возвращает к выбору в любой момент.</p></div>
+      <div class="card"><h3><span class="pic">📡</span> SSE live updates</h3><p>Состояние обновляется событийно (revision + activity), с fallback-поллингом каждые 3 сек при обрыве. Дашборд не виснет при перезагрузке конфига.</p></div>
+      <div class="card"><h3><span class="pic">🧭</span> Мастер настройки</h3><p>7 шагов: от «сейчас это обычная клавиатура» до активации: определение по нажатию, подготовка (auto-start, fallback-ввод), Zadig-гайд, проверка WinUSB, выбор режима.</p></div>
+      <div class="card"><h3><span class="pic">🔧</span> Диагностика и Help</h3><p>Страница Diagnostics: состояние устройства, pipe, config, лог. Help/Setup: откат драйвера, беспроводные клавиатуры, предупреждение об античите.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="presets">
+  <div class="wrap">
+    <span class="eyebrow">Каталог шаблонов</span>
+    <h2>Pad-шаблоны: клавиша → действие</h2>
+    <p class="sub">Каждый шаблон = готовый targeted/basic-профиль с F1–F12. Хоткеи для DAW/видео/фото сверены с официальными мануалами (REAPER User Guide v7.78, DaVinci Resolve 19 Reference, Ableton Live 12 KB, Adobe Premiere Default Shortcuts, Lightroom Classic KB).</p>
+    <div class="grid3">
+      <div class="preset"><h4>AI pad <span class="tag agent">agent</span></h4><p>Codex, ChatGPT, Claude, Cursor, Devin, Copilot</p><ul><li><span class="kbd">F1</span> Accept / Send</li><li><span class="kbd">F2</span> Cancel (Esc)</li><li><span class="kbd">F4</span> Toggle sidebar</li><li><span class="kbd">F6</span> Voice / PTT</li><li><span class="kbd">F11</span> Play / pause media</li></ul></div>
+      <div class="preset"><h4>Media <span class="tag usecase">use-case</span></h4><p>Глобальные медиаклавиши (basic)</p><ul><li><span class="kbd">F1</span> Play / pause</li><li><span class="kbd">F2</span> Next track</li><li><span class="kbd">F3</span> Prev track</li><li><span class="kbd">F6</span> Volume −</li><li><span class="kbd">F8</span> Play sup / Space</li></ul></div>
+      <div class="preset"><h4>OBS / Streaming <span class="tag usecase">use-case</span></h4><p>Укажите те же хоткеи в OBS</p><ul><li><span class="kbd">F1</span> Start / stop recording</li><li><span class="kbd">F2</span> Start / stop streaming</li><li><span class="kbd">F4</span> Mute mic</li><li><span class="kbd">F6</span> Close OBS</li></ul></div>
+      <div class="preset"><h4>Meet / Zoom <span class="tag usecase">use-case</span></h4><p>Созвоны</p><ul><li><span class="kbd">F1</span> Mic off / on</li><li><span class="kbd">F2</span> Camera off / on</li><li><span class="kbd">F3</span> Raise hand</li><li><span class="kbd">F6</span> Leave call</li></ul></div>
+      <div class="preset"><h4>PowerPoint <span class="tag usecase">use-case</span></h4><p>Презентации</p><ul><li><span class="kbd">F1</span> Start slideshow</li><li><span class="kbd">F3</span> Next slide</li><li><span class="kbd">F6</span> Black screen</li><li><span class="kbd">F8</span> First slide</li></ul></div>
+      <div class="preset"><h4>REAPER DAW <span class="tag usecase">use-case</span></h4><p>Официальные хоткеи v7.78</p><ul><li><span class="kbd">F1</span> Play / stop</li><li><span class="kbd">F3</span> Record</li><li><span class="kbd">F4</span> Split item</li><li><span class="kbd">F6</span> Rewind</li><li><span class="kbd">F12</span> New track</li></ul></div>
+      <div class="preset"><h4>DaVinci Resolve <span class="tag usecase">use-case</span></h4><p>Хоткеи Resolve 19 (media = Shift+2!)</p><ul><li><span class="kbd">F1</span> Play / pause</li><li><span class="kbd">F2</span> Rewind (J)</li><li><span class="kbd">F4</span> Mark in</li><li><span class="kbd">F8</span> Blade edit mode</li><li><span class="kbd">F10</span> Media browser</li></ul></div>
+      <div class="preset"><h4>Ableton Live <span class="tag usecase">use-case</span></h4><p>Официальные хоткеи 12</p><ul><li><span class="kbd">F1</span> Record (глоб.)</li><li><span class="kbd">F2</span> Play / stop</li><li><span class="kbd">F3</span> Metronome</li><li><span class="kbd">F6</span> Session ↔ Arrangement</li><li><span class="kbd">F11</span> MIDI map mode</li></ul></div>
+      <div class="preset"><h4>Adobe Premiere <span class="tag usecase">use-case</span></h4><p>Дефолты Premiere Pro</p><ul><li><span class="kbd">F1</span> Play / stop</li><li><span class="kbd">F4</span> Scrub forward</li><li><span class="kbd">F9</span> Ripple delete</li><li><span class="kbd">F10</span> Match frame</li><li><span class="kbd">F12</span> Save project</li></ul></div>
+      <div class="preset"><h4>Lightroom Classic <span class="tag usecase">use-case</span></h4><p>Официальные хоткеи LrC</p><ul><li><span class="kbd">F1</span> Grid</li><li><span class="kbd">F2</span> Loupe</li><li><span class="kbd">F3</span> Develop</li><li><span class="kbd">F5</span> Flag pick</li><li><span class="kbd">F11</span> Prev photo</li></ul></div>
+    </div>
+  </div>
+</section>
+
+<section id="api">
+  <div class="wrap">
+    <span class="eyebrow">Интеграция</span>
+    <h2>Локальный HTTP API (loopback, CSRF-protected)</h2>
+    <p class="sub">Все операции доступны с <code>127.0.0.1:8765</code>: состояние, устройства, профили, пресеты, активность, экспорт/импорт конфига. Включён новый эндпоинт <code>POST /api/v1/action/fire</code> — выполнить действие программно, как будто нажата клавиша.</p>
+<pre><code>curl http://127.0.0.1:8765/api/profiles        # список профилей
+curl http://127.0.0.1:8765/api/v1/state        # unified snapshot
+curl http://127.0.0.1:8765/api/v1/hid          # устройства + состояние драйвера
+curl http://127.0.0.1:8765/api/v1/presets      # каталог pad-шаблонов
+curl http://127.0.0.1:8765/api/v1/activity     # последние сработавшие действия
+
+TOKEN=$(curl -s http://127.0.0.1:8765/ | grep -o 'CSRF_TOKEN="[^"]*"' | grep -o '"[^"]*"' | tr -d '"')
+# программно выполнить действие (Live click-to-fire извне):
+curl -X POST http://127.0.0.1:8765/api/v1/action/fire \
+  -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" \
+  -d '{"action":"{Media_Play_Pause}","usage":42,"profile":""}'
+# включить шаблон «REAPER DAW»:
+curl -X POST http://127.0.0.1:8765/api/v1/preset/apply \
+  -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" \
+  -d '{"agentId":"reaper","name":"REAPER pad"}'</code></pre>
+    <div class="grid3">
+      <div class="card"><h3><span class="pic">🔒</span> Безопасность</h3><p>Сервер слушает только <code>127.0.0.1</code>, требует CSRF-токен <code>X-KeySidekick-Token</code> на мутирующие запросы и проверяет loopback-Origin. Извне недоступен.</p></div>
+      <div class="card"><h3><span class="pic">💾</span> Экспорт / импорт</h3><p>База64-конфиг: одна кнопка — скачивание <code>keysidekick-config.ini</code> + копия текста в буфер обмена. Импорт валидирует и атомарно перезаписывает конфиг.</p></div>
+      <div class="card"><h3><span class="pic">🔌</span> SSE + revision</h3><p>Каждая мутация поднимает <code>stateRevision</code> и шлёт SSE-событие — клиенты синхронизируются без опроса. Activity-лента — тоже через SSE.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <span class="eyebrow">Архитектура</span>
+    <h2>Что внутри репозитория</h2>
+    <div class="grid3">
+      <div class="card"><h3><span class="pic">🧠</span> <code>src/sidekick.cpp</code></h3><p>~5k строк: WinUSB-пайп, async-чтение HID, дифф нажатий, диспетчеризация по профилям, HTTP-сервер на WS2_32, SSE, SSE-токен, трей, мастер-маршалинг записей в main thread (WM_DASH_OP).</p></div>
+      <div class="card"><h3><span class="pic">🌐</span> <code>web/</code> dashboard</h3><p>Одна HTML-страница: <code>app.js</code> (дашборд + onboarding + Live + preset-wizard + action builder) + <code>styles.css</code>. Собирается в <code>dashboard_embedded.generated.h</code> через PowerShell.</p></div>
+      <div class="card"><h3><span class="pic">🧪</span> <code>tests/</code></h3><p>13 unit-тестов (config bridge, domain, windows_targets) + <code>http_integration_tests.sh</code> — 44 проверки живого API: создание профилей, маппинги, пресеты, fire-action, экспорт/импорт, devices.</p></div>
+    </div>
+    <h2 style="font-size:22px;margin-top:34px">Поток данных</h2>
+    <pre><code>Запасная клавиатура (WinUSB)
+   │  HID-отчёты (8 байт, interrupt IN)
+   ▼
+sidekick.exe ── WinUsb_ReadPipe (async)
+   │  diff key-down / key-up
+   ▼
+активный профиль (basic / targeted)
+   │
+   ├── basic:      SendInput (реинжект в системный ввод)
+   ├── targeted:   PostMessage(WND, WM_KEYDOWN/UP) в окно приложения
+   └── action:     !switch / !toggle / !launch / !app / макро-последовательности
+   │
+   ├── Activity-кольцо (cap 24) → SSE → Live-лента дашборда
+   └── BumpRevision() → SSE → перерисовка дашборда</code></pre>
+  </div>
+</section>
+
+<section id="build">
+  <div class="wrap">
+    <span class="eyebrow">Сборка и тесты</span>
+    <h2>Быстрый старт</h2>
+    <div class="grid2">
+      <div class="card"><h3><span class="pic">🏗️</span> Сборка (MinGW-w64)</h3>
+<pre><code>cd src
+build.bat
+# g++ -O2 -o sidekick.exe sidekick.cpp
+#   -lsetupapi -lwinusb -luser32 -lws2_32 -lshell32 -lgdi32 -static
+# g++ -O2 -o probe_device.exe probe_device.cpp ...</code></pre>
+        <p>Требуется только MinGW g++; никаких путей Windows SDK — WinUSB/setupapi headers уже в MinGW. <code>--check-dashboard</code> сверяет свежесть встроенного дашборда при сборке.</p>
+      </div>
+      <div class="card"><h3><span class="pic">🧪</span> Тесты</h3>
+<pre><code>cd tests
+run_all_tests.sh            # unit (13) + config round-trip
+# интеграция: запустить sidekick.exe, затем
+http_integration_tests.sh   # 44 проверки живого API</code></pre>
+        <p>Unit-тесты покрывают конфиг v3 (парсинг/сериализация), domain bridge, windows_targets резолвер. Интеграционные — реальный HTTP-сервер: CRUD профилей, ключи, пресеты, fire-action, экспорт/импорт, диагностика.</p>
+      </div>
+      <div class="card"><h3><span class="pic">🚀</span> Первый запуск</h3>
+<pre><code>copy src\config.example.ini src\config.ini
+# DeviceVIDPID=vid_xxxx&amp;pid_yyyy  — ваше устройство
+cd src
+run.bat</code></pre>
+        <p>Далее: дашборд <code>http://127.0.0.1:8765/</code> → «+ Setup keyboard» (мастер Zadig) → «+ Pad template» или ручные профили.</p>
+      </div>
+      <div class="card"><h3><span class="pic">📚</span> Документация</h3><p><code>ZADIG_INSTRUCTIONS.md</code> — замена драйвера и откат. <code>docs/PROBLEM-AND-SOLUTION.md</code> — техническое обоснование (почему LL-hook лагает, почему WinUSB выигрывает). <code>docs/FAQ.md</code>, <code>docs/HID-USAGE-TABLE.md</code> — таблица Usage ID для INI.</p></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    KeySidekick — GPL-3.0 · Windows 10 1809+ · основано на WinUSB by Microsoft и Zadig (LGPL) · <a href="#" style="color:var(--accent)">документация в репозитории</a>
+  </div>
+</footer>
+
+</div>
+
+<div class="lang" lang="zh" data-lang="zh">
+
+<div class="hero">
+  <div class="wrap">
+    <span class="badge">Windows 10+ · C++11 · GPL-3.0 · 仪表盘位于 127.0.0.1</span>
+    <h1>让备用键盘成为<br>Windows <span class="grad">控制台</span></h1>
+    <p class="lead">KeySidekick 通过 WinUSB 驱动把指定的 USB 键盘从系统键盘栈中解绑，直接读取它的原始 HID 报告，并按当前配置文件路由每一个按键——完全不会抢占你正在使用的应用的焦点。第二把键盘从此变成遥控器：控制 AI 智能体、媒体播放器、DAW、OBS、视频会议和演示文稿。</p>
+    <div class="cta">
+      <a class="btn primary" href="#solution">工作原理</a>
+      <a class="btn ghost" href="#features">功能特性</a>
+      <a class="btn ghost" href="#presets">Pad 模板</a>
+      <a class="btn ghost" href="#api">HTTP API</a>
+    </div>
+    <div class="hero-stats">
+      <div class="stat"><b>~5k</b><span>sidekick.cpp 的代码行数</span></div>
+      <div class="stat"><b>0 kB</b><span>内核、LL 钩子、过滤驱动：零占用</span></div>
+      <div class="stat"><b>15</b><span>个「按键 → 动作」预设模板</span></div>
+      <div class="stat"><b>13 unit + 44 integration</b><span>项真实 API 检查</span></div>
+    </div>
+  </div>
+</div>
+
+<section id="problem">
+  <div class="wrap">
+    <span class="eyebrow">问题</span>
+    <h2>Windows 无法区分不同的键盘</h2>
+    <p class="sub">你希望某一把键盘专门控制某个应用：按键不会进入活动窗口，没有延迟，也不会给系统带来任何风险。</p>
+    <table>
+      <tr><th>方案</th><th>区分键盘</th><th>拦截按键</th><th>延迟 / 风险</th></tr>
+      <tr><td><code>WH_KEYBOARD_LL</code> hook</td><td class="bad">不能——没有设备 ID</td><td class="ok">可以</td><td class="bad">会阻塞整个系统输入线程</td></tr>
+      <tr><td>Raw Input (<code>WM_INPUT</code>)</td><td class="warn">仅当 <code>hDevice != NULL</code></td><td class="bad">只读</td><td class="ok">无</td></tr>
+      <tr><td>Interception（内核过滤器）</td><td class="ok">可以</td><td class="ok">可以</td><td class="bad">内核驱动，休眠时有风险</td></tr>
+      <tr style="background:rgba(74,158,255,.07)"><td><b>WinUSB 驱动替换</b></td><td class="ok">可以——直接读取设备</td><td class="ok">可以——按键完全不进入输入队列</td><td class="ok">无延迟、无内核代码</td></tr>
+    </table>
+    <p class="sub" style="margin-top:18px">陷阱：廉价 / 复合键盘（键盘 + 触摸板）即使在 Raw Input 中也会报告 <code>hDevice == NULL</code>——无法与主键盘区分。KeySidekick 完全不依赖这一点：我们通过 WinUSB 直接读取 HID。</p>
+  </div>
+</section>
+
+<section id="solution">
+  <div class="wrap">
+    <span class="eyebrow">解决方案</span>
+    <h2>WinUSB 旁路：按键物理上不进入系统</h2>
+    <p class="sub">键盘接口从 <code>hidusb.sys → kbdhid.sys → kbdclass.sys</code> 切换到微软签名的 <code>WinUSB.sys</code>——通过 Zadig 完成。按键完全不再进入 Windows 输入队列，sidekick.exe 从异步管道读取 8 字节 HID 报告，并按配置文件进行分发。</p>
+    <div class="flow">
+      <div class="flow-step"><span class="n">1</span><b>备用键盘</b><span>MI_00 切换到 WinUSB（Zadig，一次即可）</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step"><span class="n">2</span><b>HID 报告</b><span>sidekick.exe 从 interrupt-IN 管道读取 8 字节报告</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step"><span class="n">3</span><b>配置文件</b><span>当前模式：basic / targeted，按键映射</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step"><span class="n">4</span><b>动作</b><span>SendInput、向窗口 PostMessage、!switch/!launch/!app、宏</span></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><h3><span class="pic">✅</span> 你得到什么</h3><p>没有 LL 钩子 → 没有系统延迟。即使 <code>hDevice == NULL</code> 也能工作。没有内核过滤器——只有 WHQL 签名的 WinUSB。休眠/睡眠后依然正常（WinUSB 原生处理 ACPI）。主键盘完全不受影响。</p></div>
+      <div class="card"><h3><span class="pic">⚠️</span> 需要了解</h3><p>在 sidekick.exe 运行之前，专用键盘不会输入——这是预期行为（可提前在仪表盘中配置自启动）。basic 模式会把按键标记为注入事件——在带反作弊的游戏中请使用 targeted 模式，或恢复 HID 驱动。</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <span class="eyebrow">功能特性</span>
+    <h2>仪表盘、配置文件、实时更新</h2>
+    <p class="sub">所有功能都通过内置 Web 仪表盘（<code>http://127.0.0.1:8765/</code>）管理——无需手工编辑 INI 文件。</p>
+    <div class="grid3">
+      <div class="card"><h3><span class="pic">🔄</span> 配置文件与模式</h3><p>创建、重命名、复制、删除。两种模式：<code>basic</code>——像普通键盘一样输入；<code>targeted</code>——后台发送到应用窗口（支持按住、自动重复和释放）。</p></div>
+      <div class="card"><h3><span class="pic">🎯</span> 多应用路由</h3><p>在同一个配置文件中，不同按键可以指向不同应用：<code>!app:Spotify:{Media_Play_Pause}</code>——发送给 Spotify，其余按键仍按配置文件执行。</p></div>
+      <div class="card"><h3><span class="pic">⚡</span> Live + 点击触发</h3><p>Live 屏幕显示当前配置文件映射网格和已触发动作的实时流。点击任意单元格或流中的任意条目——动作立即执行，无需实体按键。</p></div>
+      <div class="card"><h3><span class="pic">⌨️</span> Typed Action Builder</h3><p>不再使用浏览器 <code>prompt()</code>——改用模态动作编辑器：Keys/Media/Macros/Switch/Launch/Send-to-app 芯片、实时预览、从运行中的窗口选择。</p></div>
+      <div class="card"><h3><span class="pic">📦</span> 一键 Pad 模板</h3><p><code>+ Pad template</code> 一键创建带 F1–F12 的现成配置文件：AI 智能体、媒体、OBS、会议、PowerPoint、REAPER、DaVinci Resolve、Ableton、Premiere、Lightroom。</p></div>
+      <div class="card"><h3><span class="pic">🎓</span> 首次运行引导</h3><p>空仪表盘会给你三条路径：「Pad template」「创建配置文件」「键盘设置」。「Start here」按钮可随时返回选择。</p></div>
+      <div class="card"><h3><span class="pic">📡</span> SSE 实时更新</h3><p>状态通过事件驱动更新（revision + activity），连接中断时每 3 秒回退轮询。重载配置时仪表盘不会卡死。</p></div>
+      <div class="card"><h3><span class="pic">🧭</span> 设置向导</h3><p>7 步：从「现在这还是普通键盘」到激活：按键识别、准备（自启动、备用输入）、Zadig 指南、WinUSB 校验、模式选择。</p></div>
+      <div class="card"><h3><span class="pic">🔧</span> 诊断与帮助</h3><p>Diagnostics 页面：设备状态、管道、配置、日志。Help/Setup：驱动回滚、无线键盘、反作弊警告。</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="presets">
+  <div class="wrap">
+    <span class="eyebrow">模板目录</span>
+    <h2>Pad 模板：按键 → 动作</h2>
+    <p class="sub">每个模板都是一个现成的 targeted/basic 配置文件，带 F1–F12。DAW/视频/照片快捷键均对照官方手册核对（REAPER User Guide v7.78、DaVinci Resolve 19 Reference、Ableton Live 12 KB、Adobe Premiere Default Shortcuts、Lightroom Classic KB）。</p>
+    <div class="grid3">
+      <div class="preset"><h4>AI pad <span class="tag agent">agent</span></h4><p>Codex、ChatGPT、Claude、Cursor、Devin、Copilot</p><ul><li><span class="kbd">F1</span> 接受 / 发送</li><li><span class="kbd">F2</span> 取消（Esc）</li><li><span class="kbd">F4</span> 切换侧边栏</li><li><span class="kbd">F6</span> 语音 / PTT</li><li><span class="kbd">F11</span> 播放 / 暂停媒体</li></ul></div>
+      <div class="preset"><h4>Media <span class="tag usecase">use-case</span></h4><p>全局媒体键（basic）</p><ul><li><span class="kbd">F1</span> 播放 / 暂停</li><li><span class="kbd">F2</span> 下一曲</li><li><span class="kbd">F3</span> 上一曲</li><li><span class="kbd">F6</span> 音量 −</li><li><span class="kbd">F8</span> Play sup / Space</li></ul></div>
+      <div class="preset"><h4>OBS / Streaming <span class="tag usecase">use-case</span></h4><p>请在 OBS 中设置相同的快捷键</p><ul><li><span class="kbd">F1</span> 开始 / 停止录制</li><li><span class="kbd">F2</span> 开始 / 停止推流</li><li><span class="kbd">F4</span> 麦克风静音</li><li><span class="kbd">F6</span> 关闭 OBS</li></ul></div>
+      <div class="preset"><h4>Meet / Zoom <span class="tag usecase">use-case</span></h4><p>视频会议</p><ul><li><span class="kbd">F1</span> 麦克风开 / 关</li><li><span class="kbd">F2</span> 摄像头开 / 关</li><li><span class="kbd">F3</span> 举手</li><li><span class="kbd">F6</span> 离开通话</li></ul></div>
+      <div class="preset"><h4>PowerPoint <span class="tag usecase">use-case</span></h4><p>演示文稿</p><ul><li><span class="kbd">F1</span> 开始放映</li><li><span class="kbd">F3</span> 下一张</li><li><span class="kbd">F6</span> 黑屏</li><li><span class="kbd">F8</span> 第一张</li></ul></div>
+      <div class="preset"><h4>REAPER DAW <span class="tag usecase">use-case</span></h4><p>官方快捷键 v7.78</p><ul><li><span class="kbd">F1</span> 播放 / 停止</li><li><span class="kbd">F3</span> 录制</li><li><span class="kbd">F4</span> 拆分片段</li><li><span class="kbd">F6</span> 倒带</li><li><span class="kbd">F12</span> 新建轨道</li></ul></div>
+      <div class="preset"><h4>DaVinci Resolve <span class="tag usecase">use-case</span></h4><p>Resolve 19 快捷键（媒体 = Shift+2！）</p><ul><li><span class="kbd">F1</span> 播放 / 暂停</li><li><span class="kbd">F2</span> 倒带（J）</li><li><span class="kbd">F4</span> 标记入点</li><li><span class="kbd">F8</span> 刀片编辑模式</li><li><span class="kbd">F10</span> 媒体浏览器</li></ul></div>
+      <div class="preset"><h4>Ableton Live <span class="tag usecase">use-case</span></h4><p>官方快捷键 12</p><ul><li><span class="kbd">F1</span> 录制（全局）</li><li><span class="kbd">F2</span> 播放 / 停止</li><li><span class="kbd">F3</span> 节拍器</li><li><span class="kbd">F6</span> Session ↔ Arrangement</li><li><span class="kbd">F11</span> MIDI 映射模式</li></ul></div>
+      <div class="preset"><h4>Adobe Premiere <span class="tag usecase">use-case</span></h4><p>Premiere Pro 默认快捷键</p><ul><li><span class="kbd">F1</span> 播放 / 停止</li><li><span class="kbd">F4</span> 向前快进</li><li><span class="kbd">F9</span> 波纹删除</li><li><span class="kbd">F10</span> 匹配帧</li><li><span class="kbd">F12</span> 保存项目</li></ul></div>
+      <div class="preset"><h4>Lightroom Classic <span class="tag usecase">use-case</span></h4><p>LrC 官方快捷键</p><ul><li><span class="kbd">F1</span> 网格</li><li><span class="kbd">F2</span> 放大视图</li><li><span class="kbd">F3</span> 修改照片</li><li><span class="kbd">F5</span> 标记选取</li><li><span class="kbd">F11</span> 上一张</li></ul></div>
+    </div>
+  </div>
+</section>
+
+<section id="api">
+  <div class="wrap">
+    <span class="eyebrow">集成</span>
+    <h2>本地 HTTP API（仅回环，CSRF 保护）</h2>
+    <p class="sub">所有操作都可以通过 <code>127.0.0.1:8765</code> 使用：状态、设备、配置文件、预设、活动记录、配置导出/导入。包含新的 <code>POST /api/v1/action/fire</code> 端点——以编程方式执行动作，就像按下按键一样。</p>
+<pre><code>curl http://127.0.0.1:8765/api/profiles        # 配置文件列表
+curl http://127.0.0.1:8765/api/v1/state        # 统一状态快照
+curl http://127.0.0.1:8765/api/v1/hid          # 设备 + 驱动状态
+curl http://127.0.0.1:8765/api/v1/presets      # Pad 模板目录
+curl http://127.0.0.1:8765/api/v1/activity     # 最近触发的动作
+
+TOKEN=$(curl -s http://127.0.0.1:8765/ | grep -o 'CSRF_TOKEN="[^"]*"' | grep -o '"[^"]*"' | tr -d '"')
+# 以编程方式执行动作（外部 Live 点击触发）：
+curl -X POST http://127.0.0.1:8765/api/v1/action/fire \
+  -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" \
+  -d '{"action":"{Media_Play_Pause}","usage":42,"profile":""}'
+# 启用「REAPER DAW」模板：
+curl -X POST http://127.0.0.1:8765/api/v1/preset/apply \
+  -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" \
+  -d '{"agentId":"reaper","name":"REAPER pad"}'</code></pre>
+    <div class="grid3">
+      <div class="card"><h3><span class="pic">🔒</span> 安全性</h3><p>服务器只监听 <code>127.0.0.1</code>，变更请求需要 CSRF 令牌 <code>X-KeySidekick-Token</code>，并校验 loopback Origin。外部无法访问。</p></div>
+      <div class="card"><h3><span class="pic">💾</span> 导出 / 导入</h3><p>Base64 配置：一键下载 <code>keysidekick-config.ini</code>，同时把文本复制到剪贴板。导入会先校验再原子化重写配置。</p></div>
+      <div class="card"><h3><span class="pic">🔌</span> SSE + revision</h3><p>每次变更都会提升 <code>stateRevision</code> 并发送 SSE 事件——客户端无需轮询即可保持同步。活动流同样通过 SSE 推送。</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <span class="eyebrow">架构</span>
+    <h2>仓库里有什么</h2>
+    <div class="grid3">
+      <div class="card"><h3><span class="pic">🧠</span> <code>src/sidekick.cpp</code></h3><p>约 5k 行：WinUSB 管道、异步 HID 读取、按键差分、按配置文件分发、基于 WS2_32 的 HTTP 服务器、SSE、SSE 令牌、托盘、写操作主线程编组（WM_DASH_OP）。</p></div>
+      <div class="card"><h3><span class="pic">🌐</span> <code>web/</code> 仪表盘</h3><p>单个 HTML 页面：<code>app.js</code>（仪表盘 + 引导 + Live + 预设向导 + 动作编辑器）+ <code>styles.css</code>。通过 PowerShell 打包进 <code>dashboard_embedded.generated.h</code>。</p></div>
+      <div class="card"><h3><span class="pic">🧪</span> <code>tests/</code></h3><p>13 个单元测试（config bridge、domain、windows_targets）+ <code>http_integration_tests.sh</code>——44 项真实 API 检查：创建配置文件、映射、预设、fire-action、导出/导入、设备。</p></div>
+    </div>
+    <h2 style="font-size:22px;margin-top:34px">数据流</h2>
+    <pre><code>备用键盘（WinUSB）
+   │  HID 报告（8 字节，interrupt IN）
+   ▼
+sidekick.exe ── WinUsb_ReadPipe (async)
+   │  diff key-down / key-up
+   ▼
+当前配置文件（basic / targeted）
+   │
+   ├── basic:      SendInput（重新注入系统输入）
+   ├── targeted:   PostMessage(WND, WM_KEYDOWN/UP) 到应用窗口
+   └── action:     !switch / !toggle / !launch / !app / 宏序列
+   │
+   ├── 活动环形缓冲（上限 24）→ SSE → 仪表盘 Live 流
+   └── BumpRevision() → SSE → 仪表盘重绘</code></pre>
+  </div>
+</section>
+
+<section id="build">
+  <div class="wrap">
+    <span class="eyebrow">构建与测试</span>
+    <h2>快速开始</h2>
+    <div class="grid2">
+      <div class="card"><h3><span class="pic">🏗️</span> 构建（MinGW-w64）</h3>
+<pre><code>cd src
+build.bat
+# g++ -O2 -o sidekick.exe sidekick.cpp
+#   -lsetupapi -lwinusb -luser32 -lws2_32 -lshell32 -lgdi32 -static
+# g++ -O2 -o probe_device.exe probe_device.cpp ...</code></pre>
+        <p>只需要 MinGW g++；无需 Windows SDK 路径——WinUSB/setupapi 头文件已随 MinGW 提供。<code>--check-dashboard</code> 会在构建时校验内嵌仪表盘是否最新。</p>
+      </div>
+      <div class="card"><h3><span class="pic">🧪</span> 测试</h3>
+<pre><code>cd tests
+run_all_tests.sh            # 单元测试（13）+ 配置往返
+# 集成：先运行 sidekick.exe，然后
+http_integration_tests.sh   # 44 项真实 API 检查</code></pre>
+        <p>单元测试覆盖配置 v3（解析/序列化）、domain bridge、windows_targets 解析器。集成测试针对真实 HTTP 服务器：配置文件增删改查、按键、预设、fire-action、导出/导入、诊断。</p>
+      </div>
+      <div class="card"><h3><span class="pic">🚀</span> 首次运行</h3>
+<pre><code>copy src\config.example.ini src\config.ini
+# DeviceVIDPID=vid_xxxx&amp;pid_yyyy  — 你的设备
+cd src
+run.bat</code></pre>
+        <p>然后：仪表盘 <code>http://127.0.0.1:8765/</code> →「+ Setup keyboard」（Zadig 向导）→「+ Pad template」或手动创建配置文件。</p>
+      </div>
+      <div class="card"><h3><span class="pic">📚</span> 文档</h3><p><code>ZADIG_INSTRUCTIONS.md</code>——驱动更换与回滚。<code>docs/PROBLEM-AND-SOLUTION.md</code>——技术原理（为什么 LL 钩子会卡顿、为什么 WinUSB 更优）。<code>docs/FAQ.md</code>、<code>docs/HID-USAGE-TABLE.md</code>——INI 映射用的 Usage ID 表。</p></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    KeySidekick — GPL-3.0 · Windows 10 1809+ · 基于微软 WinUSB 与 Zadig（LGPL）· <a href="#" style="color:var(--accent)">仓库内文档</a>
+  </div>
+</footer>
+
+</div>
+
+<script>
+(function(){
+  var titles = {
+    en: 'KeySidekick — a spare keyboard as a Windows control deck',
+    ru: 'KeySidekick — запасная клавиатура как пульт управления Windows',
+    zh: 'KeySidekick — 让备用键盘成为 Windows 控制台'
+  };
+  function setLang(lang){
+    if (!titles[lang]) lang = 'en';
+    document.querySelectorAll('.lang').forEach(function(b){
+      b.style.display = b.getAttribute('data-lang') === lang ? 'block' : 'none';
+    });
+    document.querySelectorAll('.lang-btn').forEach(function(b){
+      b.classList.toggle('active', b.getAttribute('data-lang') === lang);
+    });
+    document.title = titles[lang];
+    try { localStorage.setItem('ks-lang', lang); } catch (e) {}
+    if (location.hash) {
+      var el = document.querySelector('.lang[data-lang="' + lang + '"] ' + location.hash);
+      if (el) el.scrollIntoView();
+    }
+  }
+  document.querySelectorAll('.lang').forEach(function(block){
+    block.addEventListener('click', function(e){
+      var a = e.target && e.target.closest ? e.target.closest('a[href^="#"]') : null;
+      if (a && a.getAttribute('href').length > 1) {
+        var t = block.querySelector(a.getAttribute('href'));
+        if (t) {
+          e.preventDefault();
+          try { history.replaceState(null, '', a.getAttribute('href')); } catch (err) {}
+          t.scrollIntoView({behavior:'smooth'});
+        }
+      }
+    });
+  });
+  document.querySelectorAll('.lang-btn').forEach(function(b){
+    b.addEventListener('click', function(){ setLang(b.getAttribute('data-lang')); });
+  });
+  var saved = 'en';
+  try { saved = localStorage.getItem('ks-lang') || 'en'; } catch (e) {}
+  if (!titles[saved]) saved = 'en';
+  setLang(saved);
+  window.setLang = setLang;
+})();
+</script>
+
+</body>
+</html>

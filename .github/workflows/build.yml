@@ -1,0 +1,111 @@
+name: build
+
+# Top-level permissions reset every unspecified scope to none, so BOTH
+# contents and actions must be granted explicitly:
+#   contents:write -> softprops/action-gh-release needs it to create the draft release
+#   actions:write  -> actions/upload-artifact@v4 needs it to upload artifacts
+permissions:
+  contents: write
+  actions: write
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test-package:
+    runs-on: windows-latest
+    steps:
+      # .sh scripts in this repo are committed with LF; without this, Windows
+      # checkout (core.autocrlf=true) converts them to CRLF and bash chokes.
+      - name: Disable CRLF conversion (must run before checkout)
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup MSYS2 (mingw-w64 gcc + curl)
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          # Default release tarball is used (no `update`) so the toolchain stays
+          # pinned to what the action's base image ships -> reproducible builds.
+          install: mingw-w64-x86_64-gcc curl
+
+      - name: Build (cmd, mingw64\bin on PATH)
+        shell: powershell
+        run: |
+          $env:PATH = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;$env:PATH"
+          Push-Location src
+          try { cmd /c build.bat } finally { Pop-Location }
+          if ($LASTEXITCODE -ne 0) { throw "src\build.bat failed with exit code $LASTEXITCODE" }
+
+      - name: Verify embedded dashboard is up to date
+        shell: powershell
+        run: |
+          $env:PATH = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;$env:PATH"
+          Push-Location src
+          try { cmd /c build.bat --check-dashboard } finally { Pop-Location }
+          if ($LASTEXITCODE -ne 0) { throw "build.bat --check-dashboard failed with exit code $LASTEXITCODE" }
+
+      - name: Unit tests (13 suites)
+        shell: msys2 {0}
+        run: |
+          set -e
+          export GXX=g++
+          ./run_all_tests.sh
+
+      - name: Integration tests (HTTP API against a running sidekick.exe)
+        shell: msys2 {0}
+        run: |
+          set -e
+          # Fresh config for the run; the suite mutates src/config.ini (CRUD)
+          # and restores nothing, so start from a clean copy every time.
+          cp src/config.example.ini src/config.ini
+          # sidekick.exe resolves config.ini relative to its CWD -> run from src/
+          cd src
+          ./sidekick.exe &
+          SIDEPID=$!
+          trap 'kill $SIDEPID 2>/dev/null || true' EXIT
+          cd ..
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8765/api/status; then
+              echo "sidekick.exe responding after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS -o /dev/null http://127.0.0.1:8765/api/status
+          ./tests/http_integration_tests.sh
+
+      - name: Package distribution ZIP + SHA256
+        shell: powershell
+        run: |
+          .\dist\make_dist.ps1
+          if ($LASTEXITCODE -ne 0) { throw "make_dist.ps1 failed with exit code $LASTEXITCODE" }
+          Get-ChildItem dist | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KeySidekick-dist
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Publish draft release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          body_path: RELEASE-NOTES-template.md

@@ -1,0 +1,41 @@
+// KeySidekick tray icon resources
+#include <winver.h>   // defines VS_VERSION_INFO == 1 (required numeric resource id)
+#define IDI_NORMAL     101
+#define IDI_TARGETED   102
+#define IDI_DISCONNECTED 103
+
+// UTF-8 source: VERSIONINFO strings below contain non-ASCII characters.
+#pragma code_page(65001)
+
+// Version identity — keep in sync with APP_VERSION in sidekick.cpp.
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,9,1,0
+ PRODUCTVERSION 0,9,1,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "KeySidekick"
+            VALUE "FileDescription", "KeySidekick — dedicated keyboard controller"
+            VALUE "FileVersion", "0.9.1"
+            VALUE "ProductName", "KeySidekick"
+            VALUE "ProductVersion", "0.9.1"
+            VALUE "LegalCopyright", "Copyright (C) 2026"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
+// Icon resources (loaded from icons/ at build time)
+IDI_ICON_NORMAL   ICON "../icons/keysidekick_normal.ico"
+IDI_ICON_TARGETED ICON "../icons/keysidekick_targeted.ico"
+IDI_ICON_DISCONNECTED ICON "../icons/keysidekick_disconnected.ico"
