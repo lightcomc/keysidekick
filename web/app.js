@@ -611,9 +611,15 @@ async function showDevices(){
   currentView='devices';
   const r=await api('GET','/api/v1/hid');
   lastDevices=r.devices||[];
+  let st=null; try{ st=await api('GET','/api/v1/state'); }catch(e){}
   const ready=lastDevices.filter(d=>d.status==='ready');
   const ordinary=lastDevices.filter(d=>d.status!=='ready');
   let h='<div class="toolbar-row" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h2>Keyboard Setup</h2><button class="btn" onclick="showDevices()">Refresh</button></div>';
+  if(st&&st.portChangeDetected){
+    h+='<div class="info-callout warn" style="margin-bottom:14px"><strong>🔌 You changed the USB port.</strong>'
+      +'<span>The keyboard '+esc(st.portChangeVidPid||'')+' is plugged into a different port — on the new port it is an ordinary keyboard again (Windows binds drivers per port). All your profiles are safe; one click restores everything:</span>'
+      +'<button class="btn primary small" style="margin-left:auto;white-space:nowrap" onclick="applyDriverSwap(\''+esc(st.portChangeVidPid||'')+'\')">Apply driver again</button></div>';
+  }
   h+='<div id="identifyFeed" class="identify-feed"></div>';
   if(!lastDevices.length){
     h+='<div class="info-callout"><strong>No input devices found.</strong><span>Connect your keyboard/mouse and make sure sidekick is running.</span></div>';
@@ -631,6 +637,7 @@ async function showDevices(){
         h+='<button class="btn small" onclick="identifyDeviceIdx('+i+')">Identify by keypress</button>';
         h+='<button class="btn small" onclick="testDeviceIdx('+i+')">Test</button>';
         h+='<button class="btn small" title="Add this exact instance by full device path (for two identical keyboards)" onclick="activateExact('+i+')">Activate exact</button>';
+        h+='<button class="btn small" title="Make it a normal keyboard again (inbox HID driver)" onclick="restoreOriginalDriver(\'vid_'+d.vid+'&pid_'+d.pid+'\')">Restore original driver</button>';
         h+='</div></div>';
       }
       h+='</div>';
@@ -816,6 +823,22 @@ function wizardProgress(current,total){
   }
   return h+'</div>';
 }
+async function applyDriverSwap(vidpid,label){
+  try{
+    const r=await api('POST','/api/v1/driver/swap',{vidpid:vidpid});
+    if(r.ok){
+      toast('Driver swap started for '+vidpid+' — confirm the UAC prompt, then the keyboard reappears automatically','success');
+    }else{
+      toast('Swap failed: '+(r.error||'unknown'),'error');
+    }
+  }catch(e){ toast('Swap failed: '+e.message,'error'); }
+}
+async function restoreOriginalDriver(vidpid){
+  try{
+    const r=await api('POST','/api/v1/driver/restore',{vidpid:vidpid});
+    toast(r.ok?'Restore started — confirm the UAC prompt':('Restore failed: '+(r.error||'unknown')),r.ok?'success':'error');
+  }catch(e){ toast('Restore failed: '+e.message,'error'); }
+}
 function vidPidParts(vp){
   const m=String(vp||'').match(/vid_([0-9a-f]{4})&pid_([0-9a-f]{4})/i);
   return m?{vid:m[1].toUpperCase(),pid:m[2].toUpperCase()}:{vid:'',pid:''};
@@ -986,6 +1009,11 @@ async function renderWizard(){
     h+=wizardProgress(4,7);
     h+='<h2>Replace the driver (Zadig)</h2>';
     h+='<p class="modal-hint">For <b>'+esc(wizardState.selectedVidPid||'your keyboard')+'</b>. The wizard watches for the device to flip to WinUSB.</p>';
+    h+='<div class="prep-item"><strong>Automatic swap (recommended)</strong>'
+      +'<p>KeySidekick can bind the Microsoft-signed WinUSB driver itself — no Zadig needed (Windows 10 1809+).</p>'
+      +'<button class="btn primary" id="wizardAutoSwapBtn" onclick="applyDriverSwap(\''+esc(wizardState.selectedVidPid||'')+'\',\'wizard\')">Swap automatically (UAC prompt)</button>'
+      +' <span class="prep-hint">After the swap the list above flips to WinUSB-ready — press Continue.</span></div>';
+    h+='<details class="advanced" style="margin:12px 0"><summary>Or do it manually with Zadig (fallback)</summary>';
     h+='<ol class="zadig-steps">';
     h+='<li>Open <b>Zadig</b> as administrator.</li>';
     h+='<li>Menu <b>Options → List All Devices</b> (enable it).</li>';
@@ -993,7 +1021,7 @@ async function renderWizard(){
     h+='<li>Set the target driver to <b>WinUSB</b> (use the ▲▼ arrows).</li>';
     h+='<li>Click <b>Replace Driver</b> (or Install Driver) and confirm.</li>';
     h+='<li>Wait for completion (~10-30 seconds).</li>';
-    h+='</ol>';
+    h+='</ol></details>';
     h+='<div class="info-callout warn"><strong>Still typing like normal after Zadig says SUCCESS?</strong><span>Zadig may have replaced a phantom copy. Select the device in Zadig and click <b>Reinstall Driver</b> (not Replace).</span></div>';
     h+='<div id="zadigStatus" class="prep-status">Watching for the device to become WinUSB-ready…</div>';
     h+='<div class="wizard-actions"><button class="btn" onclick="wizardBack()">Back</button><button class="btn primary" id="wizardZadigNext" onclick="wizardState.step=4;renderWizard()" disabled>Continue</button></div>';

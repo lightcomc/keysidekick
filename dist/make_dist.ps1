@@ -95,6 +95,7 @@ $sourceFiles += @{ Src = Join-Path $RepoRoot 'CHANGELOG.md';     Rel = 'source\C
 $entries = @(
     @{ Src = Join-Path $SrcDir  'sidekick.exe';                 Rel = 'sidekick.exe' },
     @{ Src = Join-Path $SrcDir  'probe_device.exe';             Rel = 'probe_device.exe' },
+    @{ Src = Join-Path $SrcDir  'ks_driver.exe';                Rel = 'ks_driver.exe' },
     @{ Src = Join-Path $SrcDir  'config.example.ini';           Rel = 'config.example.ini' },
     @{ Src = Join-Path $SrcDir  'run.bat';                      Rel = 'run.bat' },
     @{ Src = Join-Path $RepoRoot 'README.md';                   Rel = 'README.md' },

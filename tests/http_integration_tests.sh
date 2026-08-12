@@ -221,5 +221,17 @@ STARTUP_OFF=$(curl -s -X POST "$BASE/api/v1/startup" -H "Content-Type: applicati
 assert "startup disable → ok:true installed:false" "echo '$STARTUP_OFF' | grep -q '\"ok\":true' && echo '$STARTUP_OFF' | grep -q '\"installed\":false'"
 
 echo ""
+echo "--- Driver swap endpoints ---"
+STATE_BODY=$(curl -fsS "$BASE/api/v1/state")
+SWAP_NOVID=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/driver/swap" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{}')
+RESTORE_NOVID=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/driver/restore" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{}')
+SWAP_BADFMT=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/driver/swap" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{"vidpid":"bad;format"}')
+SWAP_GET=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/driver/swap")
+assert "state exposes portChangeDetected" "echo "$STATE_BODY" | grep -q portChangeDetected"
+assert "swap without vidpid → 400" "[ '$SWAP_NOVID' = '400' ]"
+assert "restore without vidpid → 400" "[ '$RESTORE_NOVID' = '400' ]"
+assert "swap with bad vidpid format → 400" "[ '$SWAP_BADFMT' = '400' ]"
+assert "GET /api/v1/driver/swap → 405" "[ '$SWAP_GET' = '405' ]"
+
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ] && exit 0 || exit 1

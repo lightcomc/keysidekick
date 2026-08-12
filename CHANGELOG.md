@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-08-12
+
+### Added
+
+- **Native driver swap without Zadig** — bundled `ks_driver.exe` binds the Microsoft-signed inbox `winusb.inf` to the keyboard (Windows 10 1809+, no self-signed certificates, no downloads) and restores the inbox HID driver (`input.inf`) on demand. Portable: rollback works even after KeySidekick is removed.
+- **Port-change detection** — when the keyboard is plugged into a different USB port, Windows binds the new node to the default HID driver; KeySidekick now detects that the configured VID/PID reappeared as an ordinary keyboard, flags it in the dashboard/API (`portChangeDetected`), and offers a one-click "Apply driver again" — profiles are kept per VID/PID and come back automatically.
+- **Dashboard driver controls** — devices page: port-change banner with one-click re-apply, "Restore original driver" per ready device; wizard step 3: "Swap automatically (UAC prompt)" as the primary path with the Zadig manual steps collapsed as fallback.
+- `POST /api/v1/driver/swap` and `POST /api/v1/driver/restore` HTTP endpoints (CSRF-protected, vidpid format-validated, elevation gated by UAC consent).
+
+### Changed
+
+- Release ZIP includes `ks_driver.exe`; integration suite covers the new endpoints (58 checks).
+
 ## [0.9.2] - 2026-08-12
 
 ### Security

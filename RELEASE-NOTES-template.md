@@ -1,6 +1,9 @@
-# KeySidekick 0.9.2 — Release Notes
+# KeySidekick 0.9.3 — Release Notes
 
 ## What's new
+
+- **Driver swap without Zadig** — KeySidekick now swaps the keyboard driver itself via the Microsoft-signed inbox `winusb.inf` (`ks_driver.exe`, UAC prompt), and restores the normal HID driver any time. Zadig remains as a manual fallback.
+- **Port-change recovery** — plug the keyboard into another USB port and the dashboard offers a one-click "Apply driver again"; all profiles come back automatically (they are stored per VID/PID).
 
 - **First-run onboarding** — a guided 3-path start screen (pad template / create
   profile / keyboard setup) for new installations.

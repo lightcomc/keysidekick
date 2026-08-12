@@ -56,6 +56,17 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo === Building ks_driver.exe ===
+"%GXX%" -O2 -municode -D_WIN32_WINNT=0x0600 -o ks_driver.exe ks_driver.cpp -lsetupapi -lnewdev -lshell32 -luser32 -static
+if errorlevel 1 (
+  echo Build ks_driver FAILED.
+  exit /b 1
+)
+if errorlevel 1 (
+  echo Build probe_device FAILED.
+  exit /b 1
+)
+
 echo.
 echo === Build OK ===
 echo Copy config.example.ini to config.ini and edit it before running.

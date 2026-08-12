@@ -68,7 +68,7 @@ static const char* CONFIG_FILE = "config.ini";
 static const char* LOG_FILE    = "sidekick.log";
 
 // Product version — single source of truth (mirrored in resources.rc VERSIONINFO).
-static const char* APP_VERSION = "0.9.2";
+static const char* APP_VERSION = "0.9.3";
 
 // ---- Data path resolution ----
 // config.ini and sidekick.log resolve with fallback order:
@@ -1946,6 +1946,11 @@ static void RecordIdentifyEvent(HANDLE hDevice, unsigned int vk, unsigned int ma
 static HWND g_hMsgWindow = NULL;
 static UINT g_openDashboardMsg = 0;  // от второго инстанса (app_instance)
 static std::atomic<bool> g_deviceChangeNotified{false};  // WM_DEVICECHANGE: plug/unplug
+// Port-change: клавиатура с настроенным VID/PID найдена как ОБЫЧНОЕ HID-
+// устройство (переткнули в другой порт без серийника → новый узел без WinUSB).
+static bool g_portChangeDetected = false;    // под g_csProfile
+static std::string g_portChangeVidPid;       // под g_csProfile
+static std::string g_portChangeHwid;         // под g_csProfile
 static const wchar_t* MSG_WND_CLASS = L"WinUsbRouterMsgSink";
 static const UINT_PTR TARGETED_REPEAT_TIMER_ID = 2;
 #define WM_TRAYICON (WM_APP+1)
@@ -3448,7 +3453,8 @@ static bool IsPostOnlyPath(const std::string& p) {
         "/api/v1/profile/set-default-app", "/api/v1/applications/create",
         "/api/v1/applications/test-resolve", "/api/v1/config/import",
         "/api/v1/preset/apply", "/api/v1/devices/activate", "/api/v1/action/fire",
-        "/api/v1/windows/foreground/pick", "/api/v1/devices/capture"
+        "/api/v1/windows/foreground/pick", "/api/v1/devices/capture",
+        "/api/v1/driver/swap", "/api/v1/driver/restore"
     };
     for (const char* s : kPostOnly) if (p == s) return true;
     return false;
@@ -3646,10 +3652,13 @@ static void HandleHttpConnection(SOCKET cli) {
         bool dev = DevInfoConnected();
         std::string active;
         EnterCriticalSection(&g_csProfile); active = g_activeProfile; LeaveCriticalSection(&g_csProfile);
+        bool pcDet = false;
+        EnterCriticalSection(&g_csProfile); pcDet = g_portChangeDetected; LeaveCriticalSection(&g_csProfile);
         std::string j = "{\"device\":\"" + std::string(dev ? "connected" : "disconnected")
             + "\",\"active\":\"" + JsonEscape(active) + "\",\"http\":"
             + (g_httpEnabled ? "true" : "false") + ",\"tray\":"
-            + (g_trayEnabled ? "true" : "false") + "}";
+            + (g_trayEnabled ? "true" : "false")
+            + ",\"portChangeDetected\":" + (pcDet ? "true" : "false") + "}";
         HttpSendJson(cli, j);
     }
     // GET /api/v1/state — unified snapshot with revision (Phase 4)
@@ -3665,12 +3674,19 @@ static void HandleHttpConnection(SOCKET cli) {
         appCount = g_domain.applications.size();
         LeaveCriticalSection(&g_csProfile);
         EnterCriticalSection(&g_csRevision); rev = g_stateRevision; LeaveCriticalSection(&g_csRevision);
+        bool pcDet = false; std::string pcVp;
+        EnterCriticalSection(&g_csProfile);
+        pcDet = g_portChangeDetected;
+        pcVp = g_portChangeVidPid;
+        LeaveCriticalSection(&g_csProfile);
         std::string j = "{\"version\":\"" + std::string(APP_VERSION) + "\",\"revision\":"
             + std::to_string(rev) + ",\"device\":\"" + std::string(dev ? "connected" : "disconnected")
             + "\",\"active\":\"" + JsonEscape(active) + "\",\"http\":"
             + (g_httpEnabled ? "true" : "false") + ",\"tray\":"
             + (g_trayEnabled ? "true" : "false") + ",\"profileCount\":"
-            + std::to_string(profileCount) + ",\"appCount\":" + std::to_string(appCount) + "}";
+            + std::to_string(profileCount) + ",\"appCount\":" + std::to_string(appCount)
+            + ",\"portChangeDetected\":" + (pcDet ? "true" : "false")
+            + ",\"portChangeVidPid\":\"" + JsonEscape(pcVp) + "\"}";
         HttpSendJson(cli, j);
     }
     // GET /api/profiles (полный JSON всех профилей)
@@ -4402,6 +4418,70 @@ static void HandleHttpConnection(SOCKET cli) {
                 } else {
                     Log("Startup shortcut removal failed err=%lu", err);
                     HttpSendJson(cli, "{\"error\":\"removal failed\"}", 500);
+                }
+            }
+        }
+    }
+    // POST /api/v1/driver/swap — переприменить WinUSB через ks_driver.exe
+    // (порт сменился / первый раз). Требует UAC-согласия на элевацию.
+    else if (method == "POST" && path == "/api/v1/driver/swap") {
+        std::string vidpid;
+        JsonGetStr(body, "vidpid", vidpid);
+        if (vidpid.empty()) {
+            EnterCriticalSection(&g_csProfile);
+            vidpid = g_portChangeVidPid;
+            LeaveCriticalSection(&g_csProfile);
+        }
+        if (vidpid.empty()) { HttpSendJson(cli, "{\"error\":\"missing vidpid\"}", 400); }
+        else {
+            // Формат: vid_xxxx&pid_yyyy — только hex/буквы & _ (защита от инъекции аргументов)
+            bool formatOk = true;
+            for (char c : vidpid) {
+                if (!(isalnum((unsigned char)c) || c == '&' || c == '_' || c == '-')) { formatOk = false; break; }
+            }
+            if (!formatOk) { HttpSendJson(cli, "{\"error\":\"invalid vidpid format\"}", 400); }
+            else {
+                char cmdline[512];
+                snprintf(cmdline, sizeof(cmdline), "swap %s", vidpid.c_str());
+                std::string exePath = std::string(g_exeDir[0] ? g_exeDir : ".") + "\\ks_driver.exe";
+                wchar_t wcmd[512], wexe[MAX_PATH];
+                MultiByteToWideChar(CP_ACP, 0, cmdline, -1, wcmd, 512);
+                MultiByteToWideChar(CP_ACP, 0, exePath.c_str(), -1, wexe, MAX_PATH);
+                HINSTANCE h = ShellExecuteW(NULL, L"runas", wexe, wcmd, NULL, SW_SHOWNORMAL);
+                if ((INT_PTR)h <= 32) {
+                    Log("driver/swap: ShellExecute runas failed err=%d", (int)(INT_PTR)h);
+                    HttpSendJson(cli, "{\"error\":\"failed to start ks_driver.exe (UAC cancelled?)\"}", 500);
+                } else {
+                    Log("driver/swap: launched ks_driver.exe swap %s (elevated)", vidpid.c_str());
+                    HttpSendJson(cli, "{\"ok\":true,\"started\":true,\"note\":\"Confirm the UAC prompt; the keyboard reappears automatically\"}");
+                }
+            }
+        }
+    }
+    // POST /api/v1/driver/restore — вернуть встроенный HID-драйвер (input.inf)
+    else if (method == "POST" && path == "/api/v1/driver/restore") {
+        std::string vidpid;
+        JsonGetStr(body, "vidpid", vidpid);
+        if (vidpid.empty()) { HttpSendJson(cli, "{\"error\":\"missing vidpid\"}", 400); }
+        else {
+            bool formatOk = true;
+            for (char c : vidpid) {
+                if (!(isalnum((unsigned char)c) || c == '&' || c == '_' || c == '-')) { formatOk = false; break; }
+            }
+            if (!formatOk) { HttpSendJson(cli, "{\"error\":\"invalid vidpid format\"}", 400); }
+            else {
+                char cmdline[512];
+                snprintf(cmdline, sizeof(cmdline), "restore %s", vidpid.c_str());
+                std::string exePath = std::string(g_exeDir[0] ? g_exeDir : ".") + "\\ks_driver.exe";
+                wchar_t wcmd[512], wexe[MAX_PATH];
+                MultiByteToWideChar(CP_ACP, 0, cmdline, -1, wcmd, 512);
+                MultiByteToWideChar(CP_ACP, 0, exePath.c_str(), -1, wexe, MAX_PATH);
+                HINSTANCE h = ShellExecuteW(NULL, L"runas", wexe, wcmd, NULL, SW_SHOWNORMAL);
+                if ((INT_PTR)h <= 32) {
+                    Log("driver/restore: ShellExecute runas failed err=%d", (int)(INT_PTR)h);
+                    HttpSendJson(cli, "{\"error\":\"failed to start ks_driver.exe (UAC cancelled?)\"}", 500);
+                } else {
+                    HttpSendJson(cli, "{\"ok\":true,\"started\":true,\"note\":\"Confirm the UAC prompt\"}");
                 }
             }
         }
@@ -5542,6 +5622,44 @@ static BOOL WINAPI ConsoleHandler(DWORD signal) {
     return TRUE;
 }
 
+// Port-change: настроенный VID/PID найден как обычная (не-WinUSB) клавиатура?
+static bool FindPortChangedKeyboard(std::string& vidpidOut, std::string& usbIdOut) {
+    if (!g_deviceVidPid[0]) return false;
+    // паттерны из g_deviceVidPid: "vid_xxxx&pid_yyyy[, ...]"
+    std::vector<std::string> patterns;
+    {
+        std::string s(g_deviceVidPid);
+        std::size_t pos = 0;
+        while (pos <= s.size()) {
+            std::size_t comma = s.find(',', pos);
+            std::string p = (comma == std::string::npos) ? s.substr(pos) : s.substr(pos, comma - pos);
+            while (!p.empty() && (p.front() == ' ' || p.front() == '\t')) p.erase(0, 1);
+            while (!p.empty() && (p.back() == ' ' || p.back() == '\t')) p.pop_back();
+            if (!p.empty()) patterns.push_back(ToLower(p.c_str()));
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+    }
+    if (patterns.empty()) return false;
+    std::vector<InputDeviceRow> rows;
+    EnumerateInputDevices(rows);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const InputDeviceRow& r = rows[i];
+        if (r.winusb) continue;
+        if (r.kinds.find("keyboard") == std::string::npos) continue;
+        if (r.vid.empty() || r.pid.empty()) continue;
+        std::string vp = ToLower(("vid_" + r.vid + "&pid_" + r.pid).c_str());
+        for (std::size_t k = 0; k < patterns.size(); ++k) {
+            if (vp == patterns[k]) {
+                vidpidOut = vp;
+                usbIdOut = r.usbId;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 int main(int argc, char* argv[]) {
     // --- Version flag: no side effects; works even if another instance runs ---
     for (int i = 1; i < argc; ++i) {
@@ -5611,6 +5729,26 @@ int main(int argc, char* argv[]) {
                 printf("Device not found. Dashboard at http://localhost:%d/ — waiting for device...\n", g_httpPort);
                 deviceAbsentLogged = true;
             }
+            // Port-change детект: настроенный VID/PID виден как ОБЫЧНАЯ клавиатура —
+            // значит, клавиатуру переткнули в другой порт (узел без серийника
+            // привязывается к порту, WinUSB слетел). Уведомляем дашборд/трей.
+            {
+                std::string pcVp, pcHw;
+                bool pc = FindPortChangedKeyboard(pcVp, pcHw);
+                bool prev = false;
+                EnterCriticalSection(&g_csProfile);
+                prev = g_portChangeDetected;
+                g_portChangeDetected = pc;
+                if (pc) { g_portChangeVidPid = pcVp; g_portChangeHwid = pcHw; }
+                LeaveCriticalSection(&g_csProfile);
+                if (pc && !prev) {
+                    Log("Port change detected: %s is an ordinary keyboard now (new port). Run driver swap.", pcVp.c_str());
+                    BumpRevision();   // дашборд увидит через SSE
+                } else if (!pc && prev) {
+                    g_portChangeDetected = false;
+                    BumpRevision();
+                }
+            }
             DWORD backoffMs = 2000;
             while (g_running && path.empty()) {
                 DWORD wr = MsgWaitForMultipleObjectsEx(0, NULL, backoffMs,
@@ -5627,8 +5765,10 @@ int main(int argc, char* argv[]) {
             if (!g_running) break;
             if (path.empty()) continue;
             deviceAbsentLogged = false;
+            if (g_portChangeDetected) { g_portChangeDetected = false; BumpRevision(); }
         } else if (deviceAbsentLogged) {
             deviceAbsentLogged = false;
+            if (g_portChangeDetected) { g_portChangeDetected = false; BumpRevision(); }
         }
         if (!OpenDevice(path)) {
             if (!openFailLogged) {
