@@ -70,6 +70,18 @@
   - 目标应用窗口找不到时自动启动目标应用
 - **随 Windows 自启动** —— 通过仪表盘或 API 管理
 
+## 便携模式（装在 U 盘里随身携带）
+
+KeySidekick 完全便携：`sidekick.exe` 把 `config.ini` 和日志保存在**自己旁边**（exe 所在目录，可回退到当前目录）。把整个文件夹复制到 U 盘，配置、目标和映射随行。在另一台电脑上：
+
+1. 从 U 盘运行 `sidekick.exe`。
+2. 打开仪表盘 → **+ Setup keyboard**：键盘以普通设备列出 — 更换一次驱动（**Swap automatically**，UAC 提示仅在此刻出现），或直接运行 `sidekick.exe --driver swap vid_xxxx&pid_yyyy`。
+3. 完成 — 该 VID/PID 的配置已在配置文件中并立即生效。键盘插入其他 USB 端口会被自动识别，一键「Apply driver again」即可恢复。
+
+任意机器上回滚：`sidekick.exe --driver restore vid_xxxx&pid_yyyy`（或设备管理器 → 卸载设备 → 重新插入）。
+
+**完全离线。** KeySidekick 不建立**任何网络连接**：整个程序唯一的套接字是绑定在 `127.0.0.1` 上的本地仪表盘。无遥测、无云同步、数据不出本机。云/服务器功能刻意不在范围内。
+
 ## 已知限制（使用前请阅读）
 
 - **basic 模式在游戏 / 反作弊环境中无效。** `SendInput` 会用 `LLKHF_INJECTED` 标记事件；CS:GO、Valorant 以及 EAC 保护的游戏会检测并忽略（或封禁）注入的输入。basic 模式适用于浏览器、编辑器、办公软件、终端。如果需要游戏兼容性，键盘必须保持在原生 HID 驱动上（不要使用本工具的 basic 模式——请使用 `targeted` 配置文件，或通过 Zadig 恢复驱动）。

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-08-12
+
+### Changed
+
+- **Driver helper merged into sidekick.exe** — no separate `ks_driver.exe`: `sidekick.exe --driver swap|restore|status vid_xxxx&pid_yyyy` is the CLI mode. The app never runs elevated; the UAC prompt appears only at the swap/restore moment (self-elevation inside the driver command).
+- **Portable & offline documented** — README (EN/RU/ZH): carry the folder on a USB stick, profiles travel in `config.ini`; the program makes zero network connections (the only socket is the loopback dashboard) — no telemetry, no cloud, verified by code audit.
+- Wizard shows "Profiles ready (N) — your portable setup is fully restored" after activation.
+
 ## [0.9.3] - 2026-08-12
 
 ### Added

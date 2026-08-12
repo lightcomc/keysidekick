@@ -43,7 +43,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo === Building sidekick.exe ===
-"%GXX%" -O2 -fno-strict-aliasing -D_WIN32_WINNT=0x0600 -o sidekick.exe sidekick.cpp app_instance.cpp input_ledger.cpp targeted_input.cpp runtime_storage.cpp config_domain_bridge.cpp config_v3.cpp domain_model.cpp windows_targets.cpp http_security.cpp action_parser.cpp resources.o -lsetupapi -lwinusb -luser32 -lws2_32 -lshell32 -lgdi32 -lbcrypt -lole32 -luuid -static
+"%GXX%" -O2 -fno-strict-aliasing -D_WIN32_WINNT=0x0600 -o sidekick.exe sidekick.cpp app_instance.cpp input_ledger.cpp targeted_input.cpp runtime_storage.cpp config_domain_bridge.cpp config_v3.cpp domain_model.cpp windows_targets.cpp http_security.cpp action_parser.cpp resources.o -lsetupapi -lwinusb -luser32 -lws2_32 -lshell32 -lgdi32 -lbcrypt -lole32 -luuid -lnewdev -static
 if errorlevel 1 (
   echo Build FAILED.
   exit /b 1
@@ -56,12 +56,6 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo === Building ks_driver.exe ===
-"%GXX%" -O2 -municode -D_WIN32_WINNT=0x0600 -o ks_driver.exe ks_driver.cpp -lsetupapi -lnewdev -lshell32 -luser32 -static
-if errorlevel 1 (
-  echo Build ks_driver FAILED.
-  exit /b 1
-)
 if errorlevel 1 (
   echo Build probe_device FAILED.
   exit /b 1

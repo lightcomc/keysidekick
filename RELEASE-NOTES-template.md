@@ -1,6 +1,9 @@
-# KeySidekick 0.9.3 — Release Notes
+# KeySidekick 0.9.4 — Release Notes
 
 ## What's new
+
+- **One file for everything** — the driver helper is now built into `sidekick.exe` (`--driver swap|restore|status`); the app itself never asks for admin rights, UAC appears only when you actually swap or restore the driver.
+- **Portable + fully offline** — carry the folder on a USB stick; profiles travel in `config.ini`; the program makes zero network connections (loopback dashboard only, no telemetry).
 
 - **Driver swap without Zadig** — KeySidekick now swaps the keyboard driver itself via the Microsoft-signed inbox `winusb.inf` (`ks_driver.exe`, UAC prompt), and restores the normal HID driver any time. Zadig remains as a manual fallback.
 - **Port-change recovery** — plug the keyboard into another USB port and the dashboard offers a one-click "Apply driver again"; all profiles come back automatically (they are stored per VID/PID).

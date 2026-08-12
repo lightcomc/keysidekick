@@ -18,6 +18,8 @@
 #include <windows.h>
 #include <winusb.h>
 #include <setupapi.h>
+#include <newdev.h>
+#include <shlobj.h>
 #include <dbt.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -68,7 +70,7 @@ static const char* CONFIG_FILE = "config.ini";
 static const char* LOG_FILE    = "sidekick.log";
 
 // Product version — single source of truth (mirrored in resources.rc VERSIONINFO).
-static const char* APP_VERSION = "0.9.3";
+static const char* APP_VERSION = "0.9.4";
 
 // ---- Data path resolution ----
 // config.ini and sidekick.log resolve with fallback order:
@@ -4442,17 +4444,16 @@ static void HandleHttpConnection(SOCKET cli) {
             if (!formatOk) { HttpSendJson(cli, "{\"error\":\"invalid vidpid format\"}", 400); }
             else {
                 char cmdline[512];
-                snprintf(cmdline, sizeof(cmdline), "swap %s", vidpid.c_str());
-                std::string exePath = std::string(g_exeDir[0] ? g_exeDir : ".") + "\\ks_driver.exe";
+                snprintf(cmdline, sizeof(cmdline), "--driver swap %s", vidpid.c_str());
                 wchar_t wcmd[512], wexe[MAX_PATH];
                 MultiByteToWideChar(CP_ACP, 0, cmdline, -1, wcmd, 512);
-                MultiByteToWideChar(CP_ACP, 0, exePath.c_str(), -1, wexe, MAX_PATH);
+                GetModuleFileNameW(NULL, wexe, MAX_PATH);
                 HINSTANCE h = ShellExecuteW(NULL, L"runas", wexe, wcmd, NULL, SW_SHOWNORMAL);
                 if ((INT_PTR)h <= 32) {
                     Log("driver/swap: ShellExecute runas failed err=%d", (int)(INT_PTR)h);
-                    HttpSendJson(cli, "{\"error\":\"failed to start ks_driver.exe (UAC cancelled?)\"}", 500);
+                    HttpSendJson(cli, "{\"error\":\"failed to start elevated driver swap (UAC cancelled?)\"}", 500);
                 } else {
-                    Log("driver/swap: launched ks_driver.exe swap %s (elevated)", vidpid.c_str());
+                    Log("driver/swap: launched elevated self (--driver swap %s)", vidpid.c_str());
                     HttpSendJson(cli, "{\"ok\":true,\"started\":true,\"note\":\"Confirm the UAC prompt; the keyboard reappears automatically\"}");
                 }
             }
@@ -4471,15 +4472,14 @@ static void HandleHttpConnection(SOCKET cli) {
             if (!formatOk) { HttpSendJson(cli, "{\"error\":\"invalid vidpid format\"}", 400); }
             else {
                 char cmdline[512];
-                snprintf(cmdline, sizeof(cmdline), "restore %s", vidpid.c_str());
-                std::string exePath = std::string(g_exeDir[0] ? g_exeDir : ".") + "\\ks_driver.exe";
+                snprintf(cmdline, sizeof(cmdline), "--driver restore %s", vidpid.c_str());
                 wchar_t wcmd[512], wexe[MAX_PATH];
                 MultiByteToWideChar(CP_ACP, 0, cmdline, -1, wcmd, 512);
-                MultiByteToWideChar(CP_ACP, 0, exePath.c_str(), -1, wexe, MAX_PATH);
+                GetModuleFileNameW(NULL, wexe, MAX_PATH);
                 HINSTANCE h = ShellExecuteW(NULL, L"runas", wexe, wcmd, NULL, SW_SHOWNORMAL);
                 if ((INT_PTR)h <= 32) {
                     Log("driver/restore: ShellExecute runas failed err=%d", (int)(INT_PTR)h);
-                    HttpSendJson(cli, "{\"error\":\"failed to start ks_driver.exe (UAC cancelled?)\"}", 500);
+                    HttpSendJson(cli, "{\"error\":\"failed to start elevated driver restore (UAC cancelled?)\"}", 500);
                 } else {
                     HttpSendJson(cli, "{\"ok\":true,\"started\":true,\"note\":\"Confirm the UAC prompt\"}");
                 }
@@ -5660,12 +5660,172 @@ static bool FindPortChangedKeyboard(std::string& vidpidOut, std::string& usbIdOu
     return false;
 }
 
+// =====================================================================
+//  Driver helper mode: sidekick.exe --driver swap|restore|status <vidpid>
+//  Выполняется ДО singleton/сети: это отдельный CLI-режим того же exe.
+//  Админ-права нужны только для swap/restore — самоэлевация (UAC) ровно
+//  в этот момент; само приложение всегда работает без админки.
+//  Свап: inbox winusb.inf (подписан Microsoft, Win10 1809+), без Zadig.
+//  Restore: inbox input.inf — клавиатура снова обычная.
+// =====================================================================
+struct DrvNode {
+    std::wstring instanceId;
+    std::wstring hardwareId;   // USB\VID_xxxx&PID_yyyy&MI_xx
+    std::wstring service;
+};
+
+static std::wstring DrvGetProp(HDEVINFO hDev, PSP_DEVINFO_DATA d, DWORD prop) {
+    wchar_t buf[512] = {0};
+    DWORD type = 0, needed = 0;
+    if (SetupDiGetDeviceRegistryPropertyW(hDev, d, prop, &type, (PBYTE)buf, sizeof(buf), &needed)) {
+        return std::wstring(buf);
+    }
+    return std::wstring();
+}
+
+static std::wstring DrvLowerW(std::wstring s) {
+    for (auto& c : s) c = towlower(c);
+    return s;
+}
+
+// Все present-узлы, чей hardware ID начинается с USB\VID_xxxx&PID_yyyy.
+static bool DrvFindNodes(const std::string& vidpid, std::vector<DrvNode>& nodes) {
+    if (vidpid.empty()) return false;
+    std::wstring pat;
+    {
+        int len = MultiByteToWideChar(CP_UTF8, 0, vidpid.c_str(), (int)vidpid.size(), NULL, 0);
+        if (len <= 0) return false;
+        pat.resize(len);
+        MultiByteToWideChar(CP_UTF8, 0, vidpid.c_str(), (int)vidpid.size(), &pat[0], len);
+    }
+    std::wstring hex;
+    for (auto c : pat) if (iswxdigit(c)) hex += towlower(c);
+    if (hex.size() < 8) return false;
+    wchar_t vp[64] = {0};
+    swprintf(vp, 64, L"USB\\VID_%c%c%c%c&PID_%c%c%c%c",
+             hex[0], hex[1], hex[2], hex[3], hex[4], hex[5], hex[6], hex[7]);
+    std::wstring needle = vp;
+
+    HDEVINFO hDev = SetupDiGetClassDevsW(NULL, NULL, NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    if (hDev == INVALID_HANDLE_VALUE) return false;
+    SP_DEVINFO_DATA dd = { sizeof(dd) };
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(hDev, i, &dd); ++i) {
+        std::wstring hwid = DrvGetProp(hDev, &dd, SPDRP_HARDWAREID);
+        if (DrvLowerW(hwid).find(needle) == std::wstring::npos) continue;
+        DrvNode n;
+        wchar_t iid[256] = {0};
+        SetupDiGetDeviceInstanceIdW(hDev, &dd, iid, 256, NULL);
+        n.instanceId = iid;
+        n.service = DrvGetProp(hDev, &dd, SPDRP_SERVICE);
+        n.hardwareId = hwid;
+        nodes.push_back(n);
+    }
+    SetupDiDestroyDeviceInfoList(hDev);
+    return !nodes.empty();
+}
+
+static DrvNode* DrvPickForSwap(std::vector<DrvNode>& nodes) {
+    for (auto& n : nodes)
+        if (DrvLowerW(n.hardwareId).find(L"&mi_00") != std::wstring::npos) return &n;
+    return nodes.empty() ? NULL : &nodes[0];
+}
+
+static DrvNode* DrvPickForRestore(std::vector<DrvNode>& nodes) {
+    for (auto& n : nodes)
+        if (DrvLowerW(n.service) == L"winusb") return &n;
+    return nodes.empty() ? NULL : &nodes[0];
+}
+
+static int DrvDoBind(const std::string& vidpid, bool restore) {
+    std::vector<DrvNode> nodes;
+    if (!DrvFindNodes(vidpid, nodes)) {
+        printf("No device nodes match %s — is the keyboard plugged in?\n", vidpid.c_str());
+        printf("(Nodes are per-port: after a port change run swap again for the new port.)\n");
+        return 2;
+    }
+    DrvNode* n = restore ? DrvPickForRestore(nodes) : DrvPickForSwap(nodes);
+    const wchar_t* inf = restore ? L"C:\\Windows\\INF\\input.inf" : L"C:\\Windows\\INF\\winusb.inf";
+    printf("%s %s to: %ls\n", restore ? "Restoring inbox HID driver (input.inf)" : "Binding WinUSB (inbox winusb.inf)",
+           restore ? "for" : "to", n->hardwareId.c_str());
+    BOOL reboot = FALSE;
+    BOOL ok = UpdateDriverForPlugAndPlayDevicesW(NULL, (LPWSTR)n->hardwareId.c_str(),
+                (LPWSTR)inf, INSTALLFLAG_FORCE, &reboot);
+    if (!ok) {
+        DWORD err = GetLastError();
+        printf("FAILED: UpdateDriverForPlugAndPlayDevicesW error %lu\n", err);
+        if (err == 5) printf("Run as administrator (UAC prompt should appear automatically).\n");
+        return 1;
+    }
+    printf("OK.%s\n", reboot ? " A reboot is recommended." : "");
+    if (restore) printf("The keyboard is an ordinary keyboard again.\n");
+    else printf("KeySidekick picks the keyboard up automatically; profiles are kept per VID/PID.\n");
+    return 0;
+}
+
+static int DriverCliMain(int argc, char* argv[], int startIdx) {
+    SetConsoleOutputCP(CP_UTF8);
+    if (startIdx >= argc) {
+        printf("Usage: sidekick.exe --driver swap|restore|status vid_xxxx&pid_yyyy\n");
+        printf("Windows 10 1809+ (inbox signed winusb.inf — no Zadig).\n");
+        return 1;
+    }
+    std::string cmd = argv[startIdx];
+    std::string vidpid = (startIdx + 1 < argc) ? argv[startIdx + 1] : "";
+
+    if (cmd == "status") {
+        std::vector<DrvNode> nodes;
+        if (!DrvFindNodes(vidpid, nodes)) {
+            printf("No present device nodes match %s\n", vidpid.c_str());
+            return 2;
+        }
+        printf("Matching nodes for %s:\n", vidpid.c_str());
+        for (auto& n : nodes) {
+            printf("  - %ls\n", n.instanceId.c_str());
+            printf("      hardwareId: %ls\n", n.hardwareId.c_str());
+            printf("      service:    %ls\n", n.service.empty() ? L"(none)" : n.service.c_str());
+        }
+        return 0;
+    }
+
+    if (cmd == "swap" || cmd == "restore") {
+        if (vidpid.empty()) {
+            printf("Missing vidpid (vid_xxxx&pid_yyyy).\n");
+            return 1;
+        }
+        // Самоэлевация только для мутирующих команд — UAC ровно в момент свапа.
+        if (!IsUserAnAdmin()) {
+            wchar_t self[MAX_PATH] = {0};
+            GetModuleFileNameW(NULL, self, MAX_PATH);
+            char args[1024];
+            snprintf(args, sizeof(args), "--driver %s %s", cmd.c_str(), vidpid.c_str());
+            wchar_t wargs[1024] = {0};
+            MultiByteToWideChar(CP_ACP, 0, args, -1, wargs, 1024);
+            HINSTANCE h = ShellExecuteW(NULL, L"runas", self, wargs, NULL, SW_SHOWNORMAL);
+            if ((INT_PTR)h <= 32) {
+                printf("Elevation cancelled or failed (ShellExecute error %d).\n", (int)(INT_PTR)h);
+                return 1;
+            }
+            return 0;   // elevated copy prints its own result
+        }
+        return DrvDoBind(vidpid, cmd == "restore");
+    }
+
+    printf("Unknown driver command: %s\n", cmd.c_str());
+    return 1;
+}
+
 int main(int argc, char* argv[]) {
     // --- Version flag: no side effects; works even if another instance runs ---
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
             printf("KeySidekick %s\n", APP_VERSION);
             return 0;
+        }
+    }
+    // --- Driver helper mode (before singleton/network): --driver swap|restore|status ---
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--driver") == 0) {
+            return DriverCliMain(argc, argv, i + 1);
         }
     }
     // --- Resolve config/log paths: exe dir → CWD fallback ---

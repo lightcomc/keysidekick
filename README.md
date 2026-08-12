@@ -70,6 +70,18 @@ See [`docs/PROBLEM-AND-SOLUTION.md`](docs/PROBLEM-AND-SOLUTION.md) for the full 
   - Auto-launch target apps when their window isn't found
 - **Auto-start with Windows** — managed via dashboard or API
 
+## Portable mode (carry it on a USB stick)
+
+KeySidekick is fully portable: `sidekick.exe` keeps `config.ini` and logs **next to itself** (the exe's folder, with a current-directory fallback). Copy the folder to a USB stick and profiles, targets and mappings travel with it. On another machine:
+
+1. Run `sidekick.exe` from the stick.
+2. Open the dashboard → **+ Setup keyboard**: the keyboard is listed as ordinary — swap the driver once (**Swap automatically**, the UAC prompt appears only at this moment), or run `sidekick.exe --driver swap vid_xxxx&pid_yyyy` directly.
+3. Done — profiles for this VID/PID are already in the config and apply immediately. Plugging the keyboard into a different USB port is detected with a one-click "Apply driver again".
+
+Rollback on any machine: `sidekick.exe --driver restore vid_xxxx&pid_yyyy` (or Device Manager → uninstall device → replug).
+
+**Fully offline.** KeySidekick makes **zero network connections**: the only socket in the whole program is the local dashboard bound to `127.0.0.1`. No telemetry, no cloud sync, nothing leaves the machine. Cloud/server features are intentionally out of scope.
+
 ## Known limitations (read before use)
 
 - **Basic mode does not work in games / anti-cheat.** `SendInput` marks events with `LLKHF_INJECTED`; games like CS:GO, Valorant, EAC-protected titles detect and ignore (or ban) injected input. Basic mode is fine for browsers, editors, office apps, terminals. If you need game compatibility, the keyboard must stay on the native HID driver (don't use this tool's basic mode — use a `targeted` profile, or revert the driver via Zadig).

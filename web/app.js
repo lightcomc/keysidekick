@@ -1164,6 +1164,14 @@ async function wizardActivate(){
       const next=document.getElementById('wizardVerifyNext');
       if(next)next.disabled=false;
       toast('Keyboard is now the active device','success');
+      // Portable-сценарий: профили из config.ini уже под рукой — показываем сколько.
+      try{
+        const pr=await api('GET','/api/profiles');
+        const n=(pr.profiles||[]).length;
+        if(n>0){
+          toast('Profiles ready ('+n+') — your portable setup is fully restored','success');
+        }
+      }catch(e){}
     }else{
       if(el){el.textContent='Failed: '+(r.error||'unknown');el.className='prep-status warn';}
       toast('Activate failed: '+(r.error||'unknown'),'error');
