@@ -70,7 +70,7 @@ static const char* CONFIG_FILE = "config.ini";
 static const char* LOG_FILE    = "sidekick.log";
 
 // Product version — single source of truth (mirrored in resources.rc VERSIONINFO).
-static const char* APP_VERSION = "0.9.5";
+static const char* APP_VERSION = "0.9.6";
 
 // ---- Data path resolution ----
 // config.ini and sidekick.log resolve with fallback order:
@@ -302,6 +302,12 @@ static void ProjectDomainToRuntime() {
 // используют их до определения HTTP API.
 static std::atomic<bool> g_captureArmed{false};
 static std::atomic<int>  g_capturedUsage{0};
+// Окно прослушивания identify (15с, как в дашборде): пока активно, basic-режим
+// НЕ ре-инжектит выделенную клавиатуру — иначе её клавиши печатаются в дашборд
+// и засоряют Raw Input-фид нашими же SendInput-событиями (hDevice=NULL →
+// «can't attribute»). Swallow: клавиши выделенной клавиатуры молчат.
+static std::atomic<bool> g_identifyListening{false};
+static std::atomic<DWORD> g_identifyStartTick{0};
 
 // --- Live activity: какие клавиши-actions недавно сработали (для Live-экрана) ---
 struct ActivityEvent {
@@ -1333,6 +1339,19 @@ static void ProcessReport(const BYTE* report, DWORD len) {
 
     // --- BASIC режим ---
     if (prof.mode == MODE_BASIC) {
+        // Identify-окно (дашборд слушает Raw Input): НЕ ре-инжектим выделенную
+        // клавиатуру. Иначе: (1) её клавиши печатаются в сам дашборд/визард;
+        // (2) наш SendInput попадает обратно в Raw Input с hDevice=NULL и фид
+        // показывает «can't attribute (composite)» на НАШИ ЖЕ инжекты.
+        // Состояние edge-детекта синхронизируем, чтобы после окна не было
+        // ложных key-up/key-down.
+        DWORD since = GetTickCount() - g_identifyStartTick.load();
+        if (g_identifyListening.load() && since < 15000) {
+            for (int k = 0; k < 6; k++) g_prevReport[k] = (k < ncur) ? cur[k] : 0;
+            g_prevModifiers = curMods;
+            return;
+        }
+        if (since >= 15000) g_identifyListening.store(false);
         // Сначала собрать usage, у которых есть action-mapping в этом профиле → обработать их, исключить из re-inject
         std::vector<int> exceptUsages;
         for (int j = 0; j < ncur; j++) {
@@ -4716,6 +4735,9 @@ static void HandleHttpConnection(SOCKET cli) {
     // POST /api/v1/input/identify — сброс и старт окна прослушивания:
     // пользователь жмёт клавишу, GET отдаёт источник (VID/PID).
     else if (method == "POST" && path == "/api/v1/input/identify") {
+        // Окно прослушивания 15с: basic-режим глотает выделенную клавиатуру.
+        g_identifyListening.store(true);
+        g_identifyStartTick.store(GetTickCount());
         EnterCriticalSection(&g_csIdentified);
         g_identified.has = false;
         g_identified.identifiable = false;
@@ -5601,6 +5623,24 @@ static void ReadLoop() {
 // Release only keys that KeySidekick actually injected (ownership ledger).
 // This prevents releasing Ctrl/Shift held by the main keyboard.
 // For each owned key, send KEYUP with both vk and scan (reliable release).
+// Страховка после жёсткого kill предыдущего инстанса: SendInput-инъекции
+// переживают процесс-инжектор (key-up мог не успеть/не быть отправлен).
+// Гасим возможные «залипшие» модификаторы при старте. Если пользователь в
+// этот момент физически держит модификатор — он нажмёт его заново.
+static void ReleaseAllModifiers() {
+    static const BYTE vks[] = { VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL,
+                                VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN,
+                                VK_SHIFT, VK_CONTROL, VK_MENU };
+    for (BYTE vk : vks) {
+        INPUT in = {0};
+        in.type = INPUT_KEYBOARD;
+        in.ki.wVk = vk;
+        in.ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(1, &in, sizeof(INPUT));
+    }
+    Log("Modifier safety release done (post-kill cleanup)");
+}
+
 static void ReleaseAllKeys() {
     // Map scan+extended → vk for reliable release
     static const struct { unsigned short scan; bool extended; unsigned short vk; } SCAN_TO_VK[] = {
@@ -5892,6 +5932,7 @@ int main(int argc, char* argv[]) {
     printf("=== KeySidekick ===\n");
     printf("Device: %s | Profiles: %zu | Active: %s\n", g_deviceVidPid, g_profiles.size(), g_activeProfile.c_str());
     printf("HTTP: %s | Tray: %s\n", g_httpEnabled ? "on" : "off", g_trayEnabled ? "on" : "off");
+    ReleaseAllModifiers();   // снять возможные «залипшие» модификаторы от прошлого kill
     printf("Ctrl+C to exit.\n\n");
     Log("Started v2. profiles=%zu active=%s http=%d tray=%d",
         g_profiles.size(), g_activeProfile.c_str(), (int)g_httpEnabled, (int)g_trayEnabled);

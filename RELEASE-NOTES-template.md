@@ -1,6 +1,9 @@
-# KeySidekick 0.9.5 — Release Notes
+# KeySidekick 0.9.6 — Release Notes
 
 ## What's new
+
+- **Identify window no longer polluted** — during the 15-second keypress-identify window the dedicated keyboard is not re-injected, so its keys don't type into the wizard and the Raw Input feed shows real devices only.
+- **Startup safety release** — Shift/Ctrl/Alt/Win are released on start to clean up any leftovers from a hard-killed previous instance.
 
 - **Fixed: stuck Ctrl/Shift during device tests** — the wizard's detect/capture probes no longer steal input reports from the active keyboard (the root cause of injected modifiers staying pressed until unplug).
 

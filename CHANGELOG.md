@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-08-13
+
+### Fixed
+
+- **Identify feed pollution by own re-injection** — while the dashboard's keypress-identify window is active (15s), basic mode stops re-injecting the dedicated keyboard: its keys no longer type into the wizard itself and no longer appear in the Raw Input feed as "can't attribute" (those were KeySidekick's own SendInput events, which arrive with a NULL device handle).
+- **Modifier safety release on startup** — a hard-killed previous instance could leave injected modifiers pressed forever (SendInput survives the injector process); KeySidekick now releases Shift/Ctrl/Alt/Win on start.
+
 ## [0.9.5] - 2026-08-13
 
 ### Fixed
