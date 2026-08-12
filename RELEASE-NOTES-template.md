@@ -1,6 +1,8 @@
-# KeySidekick 0.9.4 — Release Notes
+# KeySidekick 0.9.5 — Release Notes
 
 ## What's new
+
+- **Fixed: stuck Ctrl/Shift during device tests** — the wizard's detect/capture probes no longer steal input reports from the active keyboard (the root cause of injected modifiers staying pressed until unplug).
 
 - **One file for everything** — the driver helper is now built into `sidekick.exe` (`--driver swap|restore|status`); the app itself never asks for admin rights, UAC appears only when you actually swap or restore the driver.
 - **Portable + fully offline** — carry the folder on a USB stick; profiles travel in `config.ini`; the program makes zero network connections (loopback dashboard only, no telemetry).

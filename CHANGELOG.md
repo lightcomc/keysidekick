@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-08-13
+
+### Fixed
+
+- **Stuck injected modifiers (auto Ctrl) during wizard/device tests** — the detect/capture probes opened the SAME WinUSB interface the read loop was reading, stealing interrupt-IN reports: a key-up was lost and the injected Ctrl/Shift stayed down until the keyboard was unplugged. Probes now skip the active interface (`IsActiveDevicePath`), and both probe endpoints release all injected keys defensively before probing.
+
 ## [0.9.4] - 2026-08-12
 
 ### Changed

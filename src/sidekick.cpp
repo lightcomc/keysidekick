@@ -70,7 +70,7 @@ static const char* CONFIG_FILE = "config.ini";
 static const char* LOG_FILE    = "sidekick.log";
 
 // Product version — single source of truth (mirrored in resources.rc VERSIONINFO).
-static const char* APP_VERSION = "0.9.4";
+static const char* APP_VERSION = "0.9.5";
 
 // ---- Data path resolution ----
 // config.ini and sidekick.log resolve with fallback order:
@@ -1389,11 +1389,20 @@ static BYTE g_interruptInPipe = 0xFF;
 // H3: HTTP-воркеры читают device-глобалы, пока main-поток их переподключает.
 // g_csDevInfo сериализует snapshot'ы против OpenDevice/CloseDevice.
 static CRITICAL_SECTION g_csDevInfo;
+static std::string g_activeDevicePath;   // интерфейс, открытый ReadLoop (под g_csDevInfo)
 static bool DevInfoConnected() {
     EnterCriticalSection(&g_csDevInfo);
     bool c = (g_hWinUsb != NULL);
     LeaveCriticalSection(&g_csDevInfo);
     return c;
+}
+static bool IsActiveDevicePath(const std::string& path) {
+    if (path.empty()) return false;
+    bool same = false;
+    EnterCriticalSection(&g_csDevInfo);
+    if (!g_activeDevicePath.empty() && _stricmp(path.c_str(), g_activeDevicePath.c_str()) == 0) same = true;
+    LeaveCriticalSection(&g_csDevInfo);
+    return same;
 }
 static void DevInfoSnapshot(bool& connected, unsigned char& pipeId) {
     EnterCriticalSection(&g_csDevInfo);
@@ -1488,6 +1497,7 @@ static BYTE QueryInterruptInPipe(WINUSB_INTERFACE_HANDLE wusb) {
 
 static bool OpenDevice(const std::string& path) {
     EnterCriticalSection(&g_csDevInfo);
+    g_activeDevicePath = path;
     int wlen = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, NULL, 0);
     std::vector<wchar_t> wpath(wlen);
     MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wpath.data(), wlen);
@@ -1529,6 +1539,7 @@ static void CloseDevice() {
     for (int index = 0; index < 6; ++index) g_prevReport[index] = 0;
     if (g_hWinUsb) { WinUsb_Free(g_hWinUsb); g_hWinUsb = NULL; }
     if (g_hDevice) { CloseHandle(g_hDevice); g_hDevice = NULL; }
+    g_activeDevicePath.clear();
     LeaveCriticalSection(&g_csDevInfo);
 }
 
@@ -4530,6 +4541,10 @@ static void HandleHttpConnection(SOCKET cli) {
     // GET /api/v1/devices/detect — probe each WinUSB keyboard: short read with 500ms timeout,
     // and tell the caller which device (if any) produced data. Used for "identify my keyboard".
     else if (method == "GET" && path == "/api/v1/devices/detect") {
+        // Страховка: сбрасываем все инжектированные клавиши ПЕРЕД пробированием —
+        // даже одна украденная/потерянная key-up не оставит «залипший» Ctrl/Shift.
+        ReleaseAllKeys();
+        ReleaseAllTargetedKeys();
         std::string j = "{\"detected\":[";
         bool firstDet = true;
 
@@ -4547,6 +4562,10 @@ static void HandleHttpConnection(SOCKET cli) {
                 det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
                 if (!SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, det, needed, NULL, NULL)) continue;
 
+                // M5: НЕ открываем интерфейс, который уже читает ReadLoop —
+                // второй ридер крадёт interrupt-IN репорты (теряются key-up →
+                // «залипшие» инжектированные модификаторы до отключения).
+                if (IsActiveDevicePath(det->DevicePath)) continue;
                 // Try opening + reading from this device for 500ms
                 HANDLE h = CreateFileA(det->DevicePath, GENERIC_READ | GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
@@ -4600,6 +4619,8 @@ static void HandleHttpConnection(SOCKET cli) {
     // Opens each available device briefly and captures which one produced data.
     // Used by onboarding wizard: "press any key on your keyboard".
     else if (method == "POST" && path == "/api/v1/devices/capture") {
+        ReleaseAllKeys();
+        ReleaseAllTargetedKeys();
         std::string j = "{\"found\":null,\"counts\":{}";
         DWORD start = GetTickCount();
         BYTE sampleBuf[8] = {0};
@@ -4620,6 +4641,8 @@ static void HandleHttpConnection(SOCKET cli) {
                 det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
                 if (!SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, det, needed, NULL, NULL)) continue;
 
+                // M5: не трогаем активный интерфейс ReadLoop (кража репортов).
+                if (IsActiveDevicePath(det->DevicePath)) continue;
                 // Try opening and reading for 300ms
                 HANDLE h = CreateFileA(det->DevicePath, GENERIC_READ | GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
