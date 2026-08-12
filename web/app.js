@@ -42,7 +42,7 @@ h+='</div>';
 h+='<div class="action-panel show" data-panel="keys">';for(const c of CHIPS_KEYS)h+='<button type="button" class="chip cat-keys" onclick="chipInsert(\''+c.replace(/'/g,'\\\\\'')+'\',true)">'+c+'</button>';h+='</div>';
 h+='<div class="action-panel" data-panel="media">';for(const c of CHIPS_MEDIA)h+='<button type="button" class="chip cat-media" onclick="chipInsert(\''+c+'\',true)">'+c.replace(/[{}]/g,'')+'</button>';h+='</div>';
 h+='<div class="action-panel" data-panel="switch">';
-for(const p of state.profiles){if(sel&&p.name===sel.name)continue;h+='<button type="button" class="chip cat-switch" onclick="chipSwitch(\''+esc(p.name).replace(/'/g,'\\\\\'')+'\')">Switch to '+esc(p.name)+'</button> ';}
+for(const p of state.profiles){if(sel&&p.name===sel.name)continue;h+='<button type="button" class="chip cat-switch" onclick="chipSwitch(\''+jsStr(p.name)+'\')">Switch to '+esc(p.name)+'</button> ';}
 h+='<button type="button" class="chip cat-switch" onclick="chipToggle(\'basic\')">Toggle basic</button>';
 h+='</div>';
 h+='<div class="action-panel" data-panel="launch"><button type="button" class="chip cat-launch" onclick="chipLaunch()">Choose application…</button></div>';
@@ -95,7 +95,7 @@ function abChips(){
   h+='<div class="action-panel show" data-panel="keys">';for(const c of CHIPS_KEYS)h+='<button type="button" class="chip cat-keys" onclick="abInsert(\''+c.replace(/'/g,'\\\'')+'\')">'+c+'</button>';h+='</div>';
   h+='<div class="action-panel" data-panel="media">';for(const c of CHIPS_MEDIA)h+='<button type="button" class="chip cat-media" onclick="abInsert(\''+c+'\')">'+c.replace(/[{}]/g,'')+'</button>';h+='</div>';
   h+='<div class="action-panel" data-panel="macros">';for(const m of MACROS)h+='<button type="button" class="chip cat-switch" title="'+esc(m.v)+'" onclick="abInsert(\''+m.v.replace(/'/g,"\\'")+'\')">'+esc(m.label)+'</button>';h+='<div class="combo-row"><select id="abComboMod"><option value="">— modifier —</option><option value="Ctrl">Ctrl</option><option value="Shift">Shift</option><option value="Alt">Alt</option><option value="Win">Win</option></select><input id="abComboKey" placeholder="key (B / F5 / Enter)" style="width:170px"><button type="button" class="btn small" onclick="const km=document.getElementById(\'abComboMod\').value,kk=document.getElementById(\'abComboKey\').value.trim();if(kk)abInsert(km?(\'{\'+km+\'+\'+kk.replace(/[{}]/g,\'\')+\'}\'):(\'{\'+kk.replace(/[{}]/g,\'\')+\'}\'))">Insert combo</button></div></div>';
-  h+='<div class="action-panel" data-panel="switch">';for(const p of state.profiles){if(sel&&p.name===sel.name)continue;h+='<button type="button" class="chip cat-switch" onclick="abInsert(\'!switch:'+esc(p.name).replace(/'/g,'\\\'')+'\',true)">Switch to '+esc(p.name)+'</button> ';}
+  h+='<div class="action-panel" data-panel="switch">';for(const p of state.profiles){if(sel&&p.name===sel.name)continue;h+='<button type="button" class="chip cat-switch" onclick="abInsert(\'!switch:'+jsStr(p.name)+'\',true)">Switch to '+esc(p.name)+'</button> ';}
   h+='<button type="button" class="chip cat-switch" onclick="abInsert(\'!toggle:basic\',true)">Toggle basic</button></div>';
   h+='<div class="action-panel" data-panel="launch"><button type="button" class="chip cat-launch" onclick="abPickLaunch()">Pick running window…</button><span class="panel-hint">Picks the app exe path of a running window into !launch:</span></div>';
   h+='<div class="action-panel" data-panel="multi"><select id="abAppTarget" style="width:100%;margin-bottom:6px"><option value="">— pick app —</option></select><div style="display:flex;gap:6px"><button type="button" class="btn small" onclick="abPickAppList()">Load running apps</button><button type="button" class="btn small" onclick="abInsertApp()">Insert !app:</button></div></div>';
@@ -164,10 +164,11 @@ async function refreshActiveTargetStatus(){const profile=state.profiles.find(p=>
 function renderLoadError(error){document.getElementById('editor').innerHTML='<div class="empty-card"><span class="eyebrow">Dashboard unavailable</span><h2>Profiles could not be loaded</h2><p>'+esc(error&&error.message?error.message:'KeySidekick did not return profile data.')+'</p><button type="button" class="btn primary" onclick="refresh()">Retry</button></div>';}
 async function refresh(){try{const status=await api('GET','/api/status');const profiles=await api('GET','/api/profiles');const appsResp=await api('GET','/api/v1/applications');state=profiles;state.apps=appsResp.applications||[];updateStatus(status);if(currentView!=='new'){let nextName=selectedProfileName;if(!state.profiles.some(p=>p.name===nextName))nextName=state.active;if(!state.profiles.some(p=>p.name===nextName)&&state.profiles.length)nextName=state.profiles[0].name;selectedProfileName=nextName||'';sel=cloneProfile(state.profiles.find(p=>p.name===selectedProfileName));profileDirty=false;}renderSidebar();if(currentView==='profile'){if(!state.profiles.some(p=>!p.isBuiltin)&&!localStorage.getItem('ks_onboarded'))renderOnboarding();else renderEditor();}refreshActiveTargetStatus();}catch(error){renderLoadError(error);}}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-// Value for embedding in single quotes inside an inline handler:
-// backslash first so \x and \P in processPath are not eaten by the JS parser.
-function jsStr(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
-function selectProfile(name){const profile=state.profiles.find(p=>p.name===name);if(!profile)return;selectedProfileName=name;sel=cloneProfile(profile);currentView='profile';profileDirty=false;renderSidebar();renderEditor();}
+// Value for embedding in single-quoted JS strings inside double-quoted HTML
+// attributes. Escape HTML metacharacters (& < ") first so the attribute parses
+// intact, then backslash, quote, and newlines so the JS string parses.
+function jsStr(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r/g,'\\r').replace(/\n/g,'\\n');}
+function selectProfile(name){stopAllPolling();const profile=state.profiles.find(p=>p.name===name);if(!profile)return;selectedProfileName=name;sel=cloneProfile(profile);currentView='profile';profileDirty=false;renderSidebar();renderEditor();}
 function renderSidebar(){const l=document.getElementById('profileList');const count=document.getElementById('profileCount');if(count)count.textContent=state.profiles.length;l.innerHTML='';for(const p of state.profiles){const button=document.createElement('button');button.type='button';button.className='profile-item'+(p.name===state.active?' is-active':'')+(currentView==='profile'&&p.name===selectedProfileName?' is-selected':'');button.innerHTML='<span class="profile-copy"><strong>'+esc(p.name)+'</strong><small>'+esc(profileModeLabel(p))+' · '+p.keys.length+' mapping'+(p.keys.length===1?'':'s')+'</small></span>'+(p.name===state.active?'<span class="active-badge">Active</span>':'');button.onclick=()=>selectProfile(p.name);l.appendChild(button);}}
 function markProfileDirty(){profileDirty=true;const save=document.getElementById('saveProfileBtn');if(save)save.disabled=false;const status=document.getElementById('saveState');if(status)status.textContent='Unsaved changes';}
 function toggleTargetSettings(mode){const target=document.getElementById('targetSettings');if(target)target.hidden=mode!=='targeted';markProfileDirty();}
@@ -214,6 +215,7 @@ document.getElementById('editor').innerHTML=h;activeActionTab='keys';updateMappi
 if(_focusedId){const el=document.getElementById(_focusedId);if(el){try{el.focus();if(_selStart!==null&&_selEnd!==null&&el.setSelectionRange)el.setSelectionRange(_selStart,_selEnd);}catch(e){}}}}
 // ---- First-run onboarding: empty dashboard → path choice ----
 async function renderOnboarding(){
+  stopAllPolling();
   document.getElementById('editor').innerHTML='<div class="empty-card onboard-card" style="max-width:720px">'
   +'<span class="eyebrow">Welcome to KeySidekick</span>'
   +'<h2>Turn the spare keyboard into a control pad</h2>'
@@ -312,7 +314,7 @@ async function captureKey(){
 }
 // ---- Create-profile wizard: steps (preset → keyboard → extras) ----
 let createState={step:1,preset:null,kbd:''};
-function newProfile(){selectedProfileName='';currentView='new';profileDirty=true;sel={name:'',mode:'targeted',targetClass:'',targetExe:'',targetPath:'',autoStart:false,isBuiltin:false,keys:[],linkedApplications:[],isNew:true};createState={step:1,preset:null,kbd:''};renderSidebar();renderCreateWizard();}
+function newProfile(){stopAllPolling();selectedProfileName='';currentView='new';profileDirty=true;sel={name:'',mode:'targeted',targetClass:'',targetExe:'',targetPath:'',autoStart:false,isBuiltin:false,keys:[],linkedApplications:[],isNew:true};createState={step:1,preset:null,kbd:''};renderSidebar();renderCreateWizard();}
 function renderCreateWizard(){
   const h='<div class="profile-page"><header class="profile-header"><div><span class="eyebrow">New profile</span><div class="title-line"><h2>Create profile</h2></div><p>Three steps — template, keyboard, extras. Everything can be changed later.</p></div><div class="profile-actions"><button type="button" class="btn primary" onclick="saveNewProfile()" id="createFinalBtn">Create profile</button></div></header>'
   +'<div class="create-steps">'
@@ -605,6 +607,7 @@ function kindLabels(d){
   return String(d.kinds||'other').split(',').map(k=>m[k]||k).join(', ');
 }
 async function showDevices(){
+  stopAllPolling();
   currentView='devices';
   const r=await api('GET','/api/v1/hid');
   lastDevices=r.devices||[];
@@ -655,7 +658,11 @@ async function showDevices(){
 async function identifyDeviceIdx(idx){
   const d=lastDevices[idx];
   if(!d)return;
-  const devCard=document.querySelector('[data-vidpid="'+esc('vid_'+d.vid+'&pid_'+d.pid)+'"]');
+  const vp='vid_'+d.vid+'&pid_'+d.pid;
+  let devCard=null;
+  for(const c of document.querySelectorAll('[data-vidpid]')){
+    if(c.getAttribute('data-vidpid')===vp){devCard=c;break;}
+  }
   if(!devCard)return;
   devCard.classList.add('identify-active');
   toast('Press a key on this keyboard now…','info');
@@ -758,7 +765,7 @@ async function startIdentify(){
       if(lastId){
         const vp='vid_'+lastId.vid+'&pid_'+lastId.pid;
         if(vp!==identifyLastVp){ identifyLastVp=vp; highlightDevice(vp); }
-        if(st){st.innerHTML='Source: <b>VID_'+lastId.vid+' PID_'+lastId.pid+'</b>';st.className='prep-status ok';}
+        if(st){st.innerHTML='Source: <b>VID_'+esc(lastId.vid)+' PID_'+esc(lastId.pid)+'</b>';st.className='prep-status ok';}
       }else if(r.listening){
         if(st){st.textContent='Windows can\'t attribute this device (composite-device limitation). Pick it from the list by name / VID / PID.';st.className='prep-status warn';}
       }
@@ -784,6 +791,14 @@ function highlightDevice(vp){
 function clearWizardTimers(){
   if(wizardPollTimer){clearInterval(wizardPollTimer);wizardPollTimer=null;}
   if(identifyPollTimer){clearInterval(identifyPollTimer);identifyPollTimer=null;}
+}
+// Останавливает ВСЕ фоновые опросы (wizard Zadig-poll, identify, capture).
+// Вызывается при любой смене экрана — иначе опросы живут вечно и дёргают API.
+function stopAllPolling(){
+  clearWizardTimers();
+  if(ct){clearInterval(ct);ct=null;}
+  const b=document.getElementById('captureBtn');
+  if(b){b.classList.remove('capture-active');b.textContent='Capture from keyboard';}
 }
 // ---- Wizard state (HID-first onboarding: ordinary → find → prepare → Zadig → verify → mode → done) ----
 let wizardState={step:0,selectedUsbId:'',selectedVidPid:'',selectedName:'',verifyPath:''};
@@ -1025,7 +1040,13 @@ async function renderWizard(){
     h+='<div class="wizard-done">';
     h+='<div class="wizard-check">✓</div>';
     h+='<h2>Ready to go</h2>';
-    h+='<p>Your keyboard is set up. It is <b>no longer an ordinary keyboard</b>: it types only while KeySidekick is running (auto-start is enabled) — keys are routed by your profile.</p>';
+    let modeText='';
+    if(wizardState.mode==='basic')modeText='It types normally in the focused app — the <b>Basic</b> profile is active.';
+    else if(wizardState.mode==='targeted')modeText='Keys are routed to <b>'+esc(wizardState.createdAppName||'your app')+'</b> — open the dashboard to add mappings.';
+    else if(wizardState.mode==='custom')modeText='The <b>Custom pad</b> profile is active — open the dashboard to add mappings (mix of typing and app control).';
+    else modeText='Keys are routed by your profile — open the dashboard to add mappings.';
+    h+='<p>Your keyboard is set up. It is <b>no longer an ordinary keyboard</b>: it types only while KeySidekick is running — '+modeText+'</p>';
+    h+='<div id="wizardDoneAutoStatus" class="prep-status">Checking auto-start…</div>';
     h+='<p style="font-size:13px;color:var(--muted);margin-top:8px">To make it a normal keyboard again: Device Manager → uninstall the WinUSB device → Action → Scan for hardware changes.</p>';
     h+='<div class="wizard-actions">';
     h+='<button class="btn primary" onclick="currentView=\'profile\';refresh();">Open dashboard</button>';
@@ -1034,6 +1055,22 @@ async function renderWizard(){
     h+='</div>';
     h+='</div>';
     document.getElementById('editor').innerHTML=h;
+    // Честная проверка auto-start: если НЕ включён — предупредить, а не утверждать обратное.
+    (async()=>{
+      const st=document.getElementById('wizardDoneAutoStatus');
+      try{
+        const s=await api('GET','/api/v1/startup');
+        if(st){
+          if(s.installed){
+            st.textContent='✓ Auto-start with Windows is enabled — the keyboard will work after reboot.';
+            st.className='prep-status ok';
+          }else{
+            st.innerHTML='<b>⚠ Auto-start is OFF.</b> After a reboot the keyboard won\'t type until you start KeySidekick manually. <button class="btn small" onclick="enableAutostart().then(function(){var x=document.getElementById(\'wizardDoneAutoStatus\');if(x){x.textContent=\'✓ Auto-start enabled\';x.className=\'prep-status ok\';}})">Enable now</button>';
+            st.className='prep-status warn';
+          }
+        }
+      }catch(e){ if(st){st.textContent='Could not check auto-start status.';st.className='prep-status warn';} }
+    })();
   }else if(wizardState.step===1.5){
     // Step 1.5: choosing an application for targeted mode
     let h='<div class="wizard-page">';
@@ -1112,10 +1149,11 @@ async function enableAutostart(){
   const st=document.getElementById('prepAutostartStatus');
   if(btn)btn.disabled=true;
   try{
-    const r=await api('POST','/api/v1/startup',{enabled:true});
-    const ok=(r.ok===true||!r.error);
-    if(st){st.textContent=ok?'✓ Auto-start enabled':'Failed: '+(r.error||'unknown');st.dataset.ok=ok?'1':'0';st.className=ok?'prep-status ok':'prep-status warn';}
-    toast(ok?'Auto-start enabled':'Auto-start failed','info');
+    const r=await api('POST','/api/v1/startup',{enabled:"true"});
+    const ok=(r.ok===true&&r.installed===true);
+    const shortFail=(r.ok===true&&r.installed===false);
+    if(st){st.textContent=ok?'✓ Auto-start enabled':(shortFail?'Shortcut creation failed':'Failed: '+(r.error||'unknown'));st.dataset.ok=ok?'1':'0';st.className=ok?'prep-status ok':'prep-status warn';}
+    toast(ok?'Auto-start enabled':(shortFail?'Shortcut creation failed':'Auto-start failed'),ok?'success':'error');
   }catch(e){
     if(st){st.textContent='Failed: '+e.message;st.dataset.ok='0';st.className='prep-status warn';}
   }finally{
@@ -1135,33 +1173,31 @@ function updatePrepReady(){
   if(next)next.disabled=!ok;
   prepStateSave(typedOk,autoOk,fallbackOk);
 }
-function wizardSelectDevice(usbId,vidpid,status){
-  wizardState.selectedUsbId=usbId;
-  wizardState.selectedVidPid=vidpid;
-  clearWizardTimers();
-  wizardState.step=(status==='ready')?4:2;
-  renderWizard();
-}
 async function wizardMode(mode){
   wizardState.mode=mode;
   if(mode==='basic'){
-    // Auto-create a basic profile and finish
+    // Создать (или переиспользовать) basic-профиль и активировать его.
+    try{ await api('POST','/api/v1/profile/create',{id:'wizard-basic',name:'Basic',mode:'basic'}); }catch(e){/* уже есть */}
     try{
-      const r=await api('POST','/api/v1/profile/create',{id:'wizard-basic',name:'Basic',mode:'basic'});
-      if(r.ok){
-        // Activate it
-        await api('POST','/api/profile/activate',{name:'Basic'});
-        toast('Profile "Basic" created and activated','success');
-      }
-    }catch(e){/* profile may already exist */}
+      const act=await api('POST','/api/profile/activate',{name:'Basic'});
+      toast(act.ok?'Profile "Basic" is active':'Basic profile is ready','success');
+    }catch(e){ toast('Failed to activate Basic','error'); }
     wizardState.step=6;
     renderWizard();
   }else if(mode==='targeted'){
-    // For targeted mode, we need to pick an app first
+    // Сначала выбираем приложение — дальше wizardConfirmApp реально сохраняет
+    // профиль + цель приложения + активирует.
     wizardState.step=1.5; // intermediate: pick target app
     renderWizard();
   }else{
-    // custom mode — straight to done
+    // custom mix — пустой targeted-профиль, маппинги пользователь добавит сам.
+    try{
+      const profName='Custom pad';
+      try{ await api('POST','/api/v1/profile/create',{id:'wizard-custom',name:profName,mode:'targeted'}); }catch(e){}
+      const act=await api('POST','/api/profile/activate',{name:profName});
+      wizardState.createdProfileName=profName;
+      toast(act.ok?'Profile "Custom pad" is active':'Custom pad is ready','success');
+    }catch(e){ toast('Failed to create Custom pad','error'); }
     wizardState.step=6;
     renderWizard();
   }
@@ -1191,15 +1227,38 @@ async function wizardConfirmApp(){
     toast('Enter application path first','error');
     return;
   }
+  const btn=document.getElementById('wizardConfirm');
+  if(btn)btn.disabled=true;
   try{
+    // Формат поля: "C:\path\app.exe" или "C:\path\app.exe (WindowClass)"
+    const m=path.match(/^(.*?)\s*\(([^()]*)\)\s*$/);
+    const exePath=m?m[1].trim():path;
+    const windowClass=m?m[2].trim():'';
+    const exeName=exePath.split(/[\\\/]/).pop()||'app';
+    const appR=await api('POST','/api/v1/applications/create',
+      {name:exeName,windowClass:windowClass,exePath:exePath,processName:exeName});
+    if(!appR.ok||!appR.id){toast('Failed to save app: '+(appR.error||'unknown'),'error');return;}
+    const profName=exeName+' pad';
+    const profId='wizard-target-'+Date.now();
+    const pr=await api('POST','/api/v1/profile/create',{id:profId,name:profName,mode:'targeted'});
+    if(!pr.ok){toast('Failed to create profile: '+(pr.error||'unknown'),'error');return;}
+    await api('POST','/api/v1/profile/link-app',{profileId:profId,appId:appR.id});
+    await api('POST','/api/v1/profile/set-default-app',{profileId:profId,appId:appR.id});
+    const act=await api('POST','/api/profile/activate',{name:profName});
+    wizardState.createdProfileName=profName;
+    wizardState.createdAppName=exeName;
+    toast(act.ok?'Profile "'+profName+'" is active':('Profile created: '+profName),act.ok?'success':'info');
     wizardState.step=6;
     renderWizard();
   }catch(e){
     toast('Failed: '+e.message,'error');
+  }finally{
+    if(btn)btn.disabled=false;
   }
 }
 // ---- Phase 7: Diagnostics + Help ----
 async function showDiagnostics(){
+  stopAllPolling();
   currentView='diagnostics';
   renderSidebar();
   const r=await api('GET','/api/v1/diagnostics');
@@ -1296,6 +1355,8 @@ function showHelp(){
 // ---- AI-agent preset wizard ("+ Agent pad") ----
 let presetState={step:0,agent:null,target:null};let windowPresetList=[];
 async function showPresetWizard(){
+  stopAllPolling();
+  stopAllPolling();
   currentView='preset';
   clearWizardTimers();
   presetState={step:0,agent:null,target:null};
@@ -1385,6 +1446,7 @@ async function presetApply(){
 let liveTimer=null;
 function stopLiveTimer(){ if(liveTimer){clearInterval(liveTimer);liveTimer=null;} }
 function showLive(){
+  stopAllPolling();
   currentView='live';
   stopLiveTimer();
   renderLive();
@@ -1430,6 +1492,7 @@ async function fireCell(btn){
   btn.disabled=false;
 }
 async function pollLive(){
+  if(currentView!=='live'){stopLiveTimer();return;}
   try{
     const r=await api('GET','/api/v1/activity');
     const ev=r.events||[];
@@ -1512,6 +1575,7 @@ function connectSSE(){
         const d=JSON.parse(e.data);
         if(d.revision&&d.revision!==LAST_REVISION){
           LAST_REVISION=d.revision;
+          if(profileDirty){renderSidebar();return;}
           await refresh();
         }
       }catch(err){}

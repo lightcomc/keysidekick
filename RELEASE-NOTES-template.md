@@ -1,4 +1,4 @@
-# KeySidekick — Release Notes
+# KeySidekick 0.9.2 — Release Notes
 
 ## What's new
 

@@ -75,6 +75,23 @@ if ($stale) {
 }
 
 # --- 4. Assemble the file list (warn + skip anything missing) -----------------
+# GPL-3.0 §6: zip несёт Corresponding Source — полный исходник, из которого
+# собран бинарник, рядом с ним.
+$sourceFiles = @()
+foreach ($f in (Get-ChildItem $SrcDir -File)) {
+    if ($f.Extension -in '.cpp', '.h', '.rc', '.bat', '.ini') {
+        $sourceFiles += @{ Src = $f.FullName; Rel = "source\src\$($f.Name)" }
+    }
+}
+foreach ($f in (Get-ChildItem (Join-Path $RepoRoot 'web') -File)) {
+    $sourceFiles += @{ Src = $f.FullName; Rel = "source\web\$($f.Name)" }
+}
+foreach ($f in (Get-ChildItem (Join-Path $RepoRoot 'tests') -File -Recurse)) {
+    $sourceFiles += @{ Src = $f.FullName; Rel = "source\$($f.FullName.Substring($RepoRoot.Length + 1))" }
+}
+$sourceFiles += @{ Src = Join-Path $RepoRoot 'run_all_tests.sh'; Rel = 'source\run_all_tests.sh' }
+$sourceFiles += @{ Src = Join-Path $RepoRoot 'CHANGELOG.md';     Rel = 'source\CHANGELOG.md' }
+
 $entries = @(
     @{ Src = Join-Path $SrcDir  'sidekick.exe';                 Rel = 'sidekick.exe' },
     @{ Src = Join-Path $SrcDir  'probe_device.exe';             Rel = 'probe_device.exe' },
@@ -86,7 +103,7 @@ $entries = @(
     @{ Src = Join-Path $RepoRoot 'docs\FAQ.md';                 Rel = 'docs\FAQ.md' },
     @{ Src = Join-Path $RepoRoot 'docs\HID-USAGE-TABLE.md';     Rel = 'docs\HID-USAGE-TABLE.md' },
     @{ Src = Join-Path $RepoRoot 'docs\PROBLEM-AND-SOLUTION.md'; Rel = 'docs\PROBLEM-AND-SOLUTION.md' }
-)
+) + $sourceFiles
 foreach ($e in $entries) {
     if (-not (Test-Path $e.Src)) {
         Write-Warning "MISSING (skipped from zip): $($e.Src)"

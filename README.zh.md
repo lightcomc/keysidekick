@@ -62,7 +62,7 @@
   - **系统托盘图标** —— 左键单击 → 仪表盘；右键单击 → 带配置文件和模式指示器的菜单
   - 位于 `127.0.0.1` 的**本地 HTTP API** —— CSRF 保护、支持 SSE
 - **可靠性：**
-  - 常驻设备循环——即使键盘断开连接，应用也保持运行
+  - 常驻设备循环——即使键盘断开连接，应用也保持运行；空闲时采用事件驱动（无轮询，无操作时零磁盘/CPU 开销）
   - 单实例互斥锁——不会重复启动
   - 注入所有权台账——只释放自己注入的按键，绝不触碰主键盘的修饰键
   - 原子化配置写入——临时文件 → 校验 → 带备份替换
@@ -194,7 +194,7 @@ run.bat
   curl -X POST http://127.0.0.1:8765/api/v1/devices/activate -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{"vidpid":"vid_xxxx&pid_yyyy"}'
   curl -X POST http://127.0.0.1:8765/api/v1/preset/apply -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{"agentId":"codex","name":"Codex pad"}'
   ```
-  > **开发者注意：** `tests/http_integration_tests.sh` 针对运行中的实例执行，并且会**修改 `src/config.ini`**——请先备份。
+  > **开发者注意：** `tests/http_integration_tests.sh` 针对运行中的实例执行；它会对 `src/config.ini` 做快照并在退出时自动恢复——无需手动备份。
 - **按键** —— 你在当前配置文件中映射到 `!switch:`/`!toggle:` 的任何按键。
 
 ---

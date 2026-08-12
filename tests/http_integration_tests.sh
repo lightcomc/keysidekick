@@ -187,6 +187,39 @@ REV_AFTER=$(curl -s "$BASE/api/v1/state" | grep -o '"revision":[0-9]*' | grep -o
 assert "revision incremented after create+switch" "[ '$REV_AFTER' -gt '$REV_BEFORE' ]"
 curl -s -X POST "$BASE/api/v1/profile/delete" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{"id":"revchk"}' >/dev/null
 
+echo "--- Extended security + round-trip ---"
+
+# Cross-origin POST with a valid token is still rejected by the Origin allow-list.
+EVIL_ORIGIN=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/profile/activate" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -H "Origin: http://evil.example" -d '{"name":"basic"}')
+assert "activate with evil Origin → 403" "[ '$EVIL_ORIGIN' = '403' ]"
+
+# Legacy mutating GET routes are gone: /switch and /profile now return 405.
+GET_SWITCH=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/switch")
+assert "GET /switch → 405" "[ '$GET_SWITCH' = '405' ]"
+GET_PROFILE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/profile")
+assert "GET /profile → 405" "[ '$GET_PROFILE' = '405' ]"
+
+# Non-JSON content type on a mutating endpoint → 415 Unsupported Media Type.
+BAD_CT=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/v1/applications/test-resolve" -H "Content-Type: text/plain" -H "X-KeySidekick-Token: $TOKEN" -d 'not-json')
+assert "test-resolve with text/plain → 415" "[ '$BAD_CT' = '415' ]"
+
+# Config export/import round-trip: export already returns base64; import it
+# back verbatim and confirm a second export yields identical bytes.
+EXPORT_1=$(curl -s "$BASE/api/v1/config/export")
+CONFIG_B64=$(echo "$EXPORT_1" | grep -o '"config":"[^"]*"' | sed 's/^"config":"//;s/"$//')
+IMPORT_RESP=$(curl -s -X POST "$BASE/api/v1/config/import" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d "{\"config\":\"$CONFIG_B64\"}")
+assert "config import → ok" "echo '$IMPORT_RESP' | grep -q '\"ok\":true'"
+EXPORT_2=$(curl -s "$BASE/api/v1/config/export")
+CONFIG_B64_2=$(echo "$EXPORT_2" | grep -o '"config":"[^"]*"' | sed 's/^"config":"//;s/"$//')
+assert "config export/import round-trip equal" "[ '$CONFIG_B64' = '$CONFIG_B64_2' ]"
+
+# Startup toggle accepts quoted-string booleans (JsonGetBool); enable then
+# disable again so no autostart shortcut is left behind on the machine.
+STARTUP_ON=$(curl -s -X POST "$BASE/api/v1/startup" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{"enabled":"true"}')
+assert "startup enable → ok:true installed:true" "echo '$STARTUP_ON' | grep -q '\"ok\":true' && echo '$STARTUP_ON' | grep -q '\"installed\":true'"
+STARTUP_OFF=$(curl -s -X POST "$BASE/api/v1/startup" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{"enabled":"false"}')
+assert "startup disable → ok:true installed:false" "echo '$STARTUP_OFF' | grep -q '\"ok\":true' && echo '$STARTUP_OFF' | grep -q '\"installed\":false'"
+
 echo ""
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ] && exit 0 || exit 1

@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <winusb.h>
 #include <setupapi.h>
+#include <dbt.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <initguid.h>
@@ -67,7 +68,7 @@ static const char* CONFIG_FILE = "config.ini";
 static const char* LOG_FILE    = "sidekick.log";
 
 // Product version — single source of truth (mirrored in resources.rc VERSIONINFO).
-static const char* APP_VERSION = "0.9.1";
+static const char* APP_VERSION = "0.9.2";
 
 // ---- Data path resolution ----
 // config.ini and sidekick.log resolve with fallback order:
@@ -106,12 +107,17 @@ static void ResolveDataPaths() {
 // =====================================================================
 //  Логирование
 // =====================================================================
+static CRITICAL_SECTION g_csLog;
+static bool g_csLogReady = false;
 void Log(const char* fmt, ...) {
     if (!g_logEnabled) return;
     va_list ap; va_start(ap, fmt);
     char msg[2048];
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    // H3: несколько потоков (HTTP-воркеры/SSE/main) пишут в один лог —
+    // сериализуем запись, чтобы строки не перемешивались.
+    if (g_csLogReady) EnterCriticalSection(&g_csLog);
     FILE* f = fopen(LOG_FILE, "a");
     if (f) {
         SYSTEMTIME st; GetLocalTime(&st);
@@ -119,6 +125,7 @@ void Log(const char* fmt, ...) {
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, msg);
         fclose(f);
     }
+    if (g_csLogReady) LeaveCriticalSection(&g_csLog);
 }
 
 static void Trim(char* s) {
@@ -537,7 +544,7 @@ struct DashOp {
     bool success;
     char error[256];
     // UAF safety: HTTP caller sets true on timeout, main thread deletes if abandoned
-    bool timedOut;
+    std::atomic<bool> timedOut;
     bool needsReconnect;   // DASH_ACTIVATE_DEVICE: переподключить устройство после WriteConfig
     bool noPersist;        // DASH_FIRE_ACTION: runtime-выполнение, config не писать
 };
@@ -900,7 +907,8 @@ static BOOL CALLBACK FindWndEnumProc(HWND h, LPARAM lp) {
 static HWND FindWindowByClass(const char* cls) {
     if (!cls || !*cls) return NULL;
     wchar_t wcls[256];
-    MultiByteToWideChar(CP_ACP, 0, cls, -1, wcls, 256);
+    int wc = MultiByteToWideChar(CP_ACP, 0, cls, -1, wcls, 256);
+    if (wc <= 0) return NULL;
     HWND h = FindWindowW(wcls, NULL);
     if (h) return h;
     // фолбэк: перечислить, найти видимое
@@ -950,7 +958,11 @@ static HWND FindTargetWindowScored(const std::string& windowClass,
 static void LaunchApp(const std::string& path) {
     if (path.empty()) return;
     wchar_t wpath[1024];
-    MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wpath, 1024);
+    int wc = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wpath, 1024);
+    if (wc <= 0 || wc >= 1024) {
+        Log("LaunchApp: path too long or invalid");
+        return;
+    }
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {0};
     std::wstring cmd = wpath;
@@ -1372,7 +1384,22 @@ static void ProcessReport(const BYTE* report, DWORD len) {
 static HANDLE g_hDevice = NULL;
 static WINUSB_INTERFACE_HANDLE g_hWinUsb = NULL;
 static BYTE g_interruptInPipe = 0xFF;
-static bool g_running = true;
+// H3: HTTP-воркеры читают device-глобалы, пока main-поток их переподключает.
+// g_csDevInfo сериализует snapshot'ы против OpenDevice/CloseDevice.
+static CRITICAL_SECTION g_csDevInfo;
+static bool DevInfoConnected() {
+    EnterCriticalSection(&g_csDevInfo);
+    bool c = (g_hWinUsb != NULL);
+    LeaveCriticalSection(&g_csDevInfo);
+    return c;
+}
+static void DevInfoSnapshot(bool& connected, unsigned char& pipeId) {
+    EnterCriticalSection(&g_csDevInfo);
+    connected = (g_hWinUsb != NULL);
+    pipeId = g_interruptInPipe;
+    LeaveCriticalSection(&g_csDevInfo);
+}
+static std::atomic<bool> g_running{true};
 static bool g_powerResume = false;
 // C2: activation ("Make active") must never tear down WinUSB from the
 // message-dispatch path — an overlapped read may be outstanding there, and
@@ -1458,21 +1485,23 @@ static BYTE QueryInterruptInPipe(WINUSB_INTERFACE_HANDLE wusb) {
 }
 
 static bool OpenDevice(const std::string& path) {
+    EnterCriticalSection(&g_csDevInfo);
     int wlen = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, NULL, 0);
     std::vector<wchar_t> wpath(wlen);
     MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wpath.data(), wlen);
     g_hDevice = CreateFileW(wpath.data(), GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-    if (g_hDevice == INVALID_HANDLE_VALUE) { g_hDevice = NULL; Log("CreateFile err=%lu", GetLastError()); return false; }
+    if (g_hDevice == INVALID_HANDLE_VALUE) { g_hDevice = NULL; LeaveCriticalSection(&g_csDevInfo); Log("CreateFile err=%lu", GetLastError()); return false; }
     if (!WinUsb_Initialize(g_hDevice, &g_hWinUsb)) {
         Log("WinUsb_Initialize err=%lu", GetLastError());
-        CloseHandle(g_hDevice); g_hDevice = NULL; return false;
+        CloseHandle(g_hDevice); g_hDevice = NULL; LeaveCriticalSection(&g_csDevInfo); return false;
     }
     g_interruptInPipe = QueryInterruptInPipe(g_hWinUsb);
     if (g_interruptInPipe == 0xFF) {
         Log("No interrupt IN endpoint found");
         WinUsb_Free(g_hWinUsb); g_hWinUsb = NULL;
         CloseHandle(g_hDevice); g_hDevice = NULL;
+        LeaveCriticalSection(&g_csDevInfo);
         return false;
     }
     // Pipe policies. timeout=0 means infinite wait (no pipe-level timeout).
@@ -1483,16 +1512,22 @@ static bool OpenDevice(const std::string& path) {
     ULONG timeoutMs = 0;
     WinUsb_SetPipePolicy(g_hWinUsb, g_interruptInPipe, PIPE_TRANSFER_TIMEOUT, sizeof(timeoutMs), &timeoutMs);
     Log("Opened device, pipe=0x%02X", g_interruptInPipe);
+    LeaveCriticalSection(&g_csDevInfo);
     return true;
 }
 
+// Инвариант: CloseDevice вызывается ТОЛЬКО когда overlapped read завершён
+// (GetOverlappedResult или AbortPipe+wait). WinUsb_Free с outstanding IRP —
+// UB по MSDN. Каждый вызов обязан сначала погасить pending read.
 static void CloseDevice() {
+    EnterCriticalSection(&g_csDevInfo);
     ReleaseAllTargetedKeys();
     ReleaseAllKeys();
     g_prevModifiers = 0;
     for (int index = 0; index < 6; ++index) g_prevReport[index] = 0;
     if (g_hWinUsb) { WinUsb_Free(g_hWinUsb); g_hWinUsb = NULL; }
     if (g_hDevice) { CloseHandle(g_hDevice); g_hDevice = NULL; }
+    LeaveCriticalSection(&g_csDevInfo);
 }
 
 static bool ReconnectDevice() {
@@ -1909,15 +1944,19 @@ static void RecordIdentifyEvent(HANDLE hDevice, unsigned int vk, unsigned int ma
 //  Окно сообщений: WM_POWERBROADCAST + tray callback
 // =====================================================================
 static HWND g_hMsgWindow = NULL;
+static UINT g_openDashboardMsg = 0;  // от второго инстанса (app_instance)
+static std::atomic<bool> g_deviceChangeNotified{false};  // WM_DEVICECHANGE: plug/unplug
 static const wchar_t* MSG_WND_CLASS = L"WinUsbRouterMsgSink";
 static const UINT_PTR TARGETED_REPEAT_TIMER_ID = 2;
 #define WM_TRAYICON (WM_APP+1)
 #define WM_HTTP_SWITCH (WM_APP+2)
+#define WM_USER_SHUTDOWN (WM_APP+5)
 #define WM_AUTO_SWITCH (WM_APP+4)  // auto-switch timer message
 static UINT g_trayTaskbarCreated = 0;   // для пересоздания иконки при рестарте explorer
 #define TRAY_UID 1
 static HMENU g_trayMenu = NULL;
 static std::string g_lastAutoSwitchCheck;   // last checked foreground process
+static HWND g_lastAutoSwitchHwnd = NULL;    // idle-guard: то же окно — ничего не делаем
 static bool g_autoSwitchEnabled = true;    // auto-switch on foreground change (enabled by default)
 static HICON g_trayIcon = NULL;
 
@@ -2082,6 +2121,10 @@ static void AutoSwitchOnForegroundChange() {
     if (!g_autoSwitchEnabled) return;
     HWND fg = GetForegroundWindow();
     if (!fg) return;
+    // Idle-guard: пока фокус на том же окне, никаких OpenProcess/Query —
+    // таймер 1с в простое стоит одного GetForegroundWindow.
+    if (fg == g_lastAutoSwitchHwnd) return;
+    g_lastAutoSwitchHwnd = fg;
     DWORD pid = 0;
     GetWindowThreadProcessId(fg, &pid);
     if (!pid) return;
@@ -2134,10 +2177,6 @@ static void StartAutoSwitchTimer() {
         SetTimer(g_hMsgWindow, 9999, 1000, NULL);
     }
 }
-static void StopAutoSwitchTimer() {
-    if (g_hMsgWindow) KillTimer(g_hMsgWindow, 9999);
-}
-
 // Case-insensitive substring search (UTF-8 safe for ASCII-only content)
 static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_INPUT) {
@@ -2206,6 +2245,14 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateTray();   // explorer перезапустился — пересоздать иконку
         return 0;
     }
+    if (msg == g_openDashboardMsg && g_openDashboardMsg != 0) {
+        // Второй инстанс попросил открыть дашборд (app_instance → FindWindowW
+        // по классу окна → точечное сообщение вместо HWND_BROADCAST).
+        char url[64];
+        snprintf(url, sizeof(url), "http://127.0.0.1:%d/", g_httpPort);
+        ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
+        return 0;
+    }
     if (msg == WM_TRAYICON) {
         // Phase 6: left-click → open dashboard, right-click → context menu
         if (lp == WM_LBUTTONUP) {
@@ -2223,6 +2270,19 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         const char* profName = (const char*)wp;
         SwitchProfileByName(profName);
         free((void*)profName);
+        return 0;
+    }
+    if (msg == WM_DEVICECHANGE) {
+        // USB plug/unplug: ждём в событийном цикле (device-absent path) —
+        // рескан энумерации запустится сразу, без периодического поллинга.
+        g_deviceChangeNotified = true;
+        return TRUE;
+    }
+    if (msg == WM_USER_SHUTDOWN) {
+        // Запрос завершения из ConsoleHandler: abort pending read ЗДЕСЬ,
+        // на main-потоке (владельце overlapped read), затем циклы видят
+        // g_running == false и выходят сами.
+        if (g_hWinUsb && g_interruptInPipe != 0xFF) WinUsb_AbortPipe(g_hWinUsb, g_interruptInPipe);
         return 0;
     }
     if (msg == WM_DASH_OP) {
@@ -2630,7 +2690,7 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         // M4: читаем timedOut ДО SetEvent — после SetEvent вызывающий может
         // освободить op (окно UAF). Если таймаут уже был — мы владеем op.
-        const bool timedOut = op->timedOut;
+        const bool timedOut = op->timedOut.load();
         SetEvent(op->doneEvent);
         if (timedOut) {
             CloseHandle(op->doneEvent);
@@ -2656,6 +2716,15 @@ static void CreateMsgWindow() {
     g_hMsgWindow = CreateWindowExW(0, MSG_WND_CLASS, L"KeySidekick",
         WS_POPUP, 0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
     g_trayTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    // Событийное пробуждение при plug/unplug: device-absent цикл ждёт
+    // сообщение WM_DEVICECHANGE вместо периодического рескана SetupAPI.
+    {
+        DEV_BROADCAST_DEVICEINTERFACE_W filter = {0};
+        filter.dbcc_size = sizeof(filter);
+        filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+        // dbcc_classguid = GUID_NULL: уведомления обо всех interface-классах.
+        RegisterDeviceNotificationW(g_hMsgWindow, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+    }
     RefreshTargetedRepeatSettings();
 
     // Raw Input identification: принимать клавиатуру+мышь в фоне (RIDEV_INPUTSINK),
@@ -2832,6 +2901,11 @@ static std::string JsonEscape(const std::string& s) {
             case '\n': out += "\\n"; break;
             case '\r': out += "\\r"; break;
             case '\t': out += "\\t"; break;
+            // defense-in-depth: никогда не выпускаем сырые < > & в ответы
+            // (защита от HTML-контекстных инъекций; JSON.parse декодирует обратно).
+            case '<': out += "\\u003c"; break;
+            case '>': out += "\\u003e"; break;
+            case '&': out += "\\u0026"; break;
             default:
                 if ((unsigned char)c < 0x20) { char b[8]; snprintf(b,sizeof(b),"\\u%04x",(unsigned char)c); out += b; }
                 else out += c;
@@ -2901,9 +2975,65 @@ static bool JsonGetStr(const std::string& body, const char* key, std::string& ou
     if (k >= body.size() || body[k] != '"') return false;
     k++;
     std::string v;
+    auto appendUtf8 = [&v](unsigned cp) {
+        if (cp < 0x80) v += (char)cp;
+        else if (cp < 0x800) { v += (char)(0xC0 | (cp >> 6)); v += (char)(0x80 | (cp & 0x3F)); }
+        else if (cp < 0x10000) { v += (char)(0xE0 | (cp >> 12)); v += (char)(0x80 | ((cp >> 6) & 0x3F)); v += (char)(0x80 | (cp & 0x3F)); }
+        else { v += (char)(0xF0 | (cp >> 18)); v += (char)(0x80 | ((cp >> 12) & 0x3F)); v += (char)(0x80 | ((cp >> 6) & 0x3F)); v += (char)(0x80 | (cp & 0x3F)); }
+    };
+    auto hexVal = [](char h) -> int {
+        if (h >= '0' && h <= '9') return h - '0';
+        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+        return -1;
+    };
     while (k < body.size() && body[k] != '"') {
-        if (body[k] == '\\' && k+1 < body.size()) { v += body[k+1]; k += 2; }
-        else { v += body[k]; k++; }
+        if (body[k] == '\\' && k+1 < body.size()) {
+            char e = body[k+1];
+            switch (e) {
+                case '"': v += '"'; k += 2; break;
+                case '\\': v += '\\'; k += 2; break;
+                case '/': v += '/'; k += 2; break;
+                case 'b': v += '\b'; k += 2; break;
+                case 'f': v += '\f'; k += 2; break;
+                case 'n': v += '\n'; k += 2; break;
+                case 'r': v += '\r'; k += 2; break;
+                case 't': v += '\t'; k += 2; break;
+                case 'u': {
+                    if (k + 5 < body.size()) {
+                        int cp = 0; bool ok = true;
+                        for (int i = 0; i < 4; ++i) {
+                            int hv = hexVal(body[k+2+i]);
+                            if (hv < 0) { ok = false; break; }
+                            cp = (cp << 4) | hv;
+                        }
+                        if (ok) {
+                            if (cp >= 0xD800 && cp <= 0xDBFF && k + 11 < body.size() &&
+                                body[k+6] == '\\' && body[k+7] == 'u') {
+                                int lo = 0; bool ok2 = true;
+                                for (int i = 0; i < 4; ++i) {
+                                    int hv = hexVal(body[k+8+i]);
+                                    if (hv < 0) { ok2 = false; break; }
+                                    lo = (lo << 4) | hv;
+                                }
+                                if (ok2 && lo >= 0xDC00 && lo <= 0xDFFF) {
+                                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                    appendUtf8(cp);
+                                    k += 12;
+                                    break;
+                                }
+                            }
+                            appendUtf8(cp);
+                            k += 6;
+                            break;
+                        }
+                    }
+                    v += body[k]; k++;
+                    break;
+                }
+                default: v += body[k]; k++; break;
+            }
+        } else { v += body[k]; k++; }
     }
     out = v;
     return true;
@@ -2916,6 +3046,9 @@ static bool JsonGetInt(const std::string& body, const char* key, int& out) {
     if (k == std::string::npos) return false;
     k++;
     while (k < body.size() && (body[k]==' '||body[k]=='\t')) k++;
+    // boolean-литералы для полей вроде autoStart (true/false)
+    if (k < body.size() && (body[k]=='t' || body[k]=='T')) { out = 1; return true; }
+    if (k < body.size() && (body[k]=='f' || body[k]=='F')) { out = 0; return true; }
     // допускаем 0x-формат
     if (k+1 < body.size() && body[k]=='0' && (body[k+1]=='x'||body[k+1]=='X')) {
         out = (int)strtol(body.c_str()+k, NULL, 16);
@@ -2924,7 +3057,48 @@ static bool JsonGetInt(const std::string& body, const char* key, int& out) {
     }
     return true;
 }
+// JsonGetBool — разбор boolean-поля ("enabled"): кавычечные "true"/"1"/"yes"
+// (lowercase-независимо), bare-литералы true/false и числа (не ноль = true).
+// Возвращает false если ключ отсутствует или значение не распарсилось.
+static bool JsonGetBool(const std::string& body, const char* key, bool& out) {
+    std::string pat = std::string("\"") + key + "\"";
+    size_t k = body.find(pat);
+    if (k == std::string::npos) return false;
+    k = body.find(':', k + pat.size());
+    if (k == std::string::npos) return false;
+    k++;
+    while (k < body.size() && (body[k]==' '||body[k]=='\t')) k++;
+    if (k >= body.size()) return false;
+    // Кавычечная строка: "true"/"1"/"yes" (и отрицания).
+    if (body[k] == '"') {
+        k++;
+        std::string v;
+        while (k < body.size() && body[k] != '"') {
+            if (body[k] == '\\' && k+1 < body.size()) { v += body[k+1]; k += 2; }
+            else { v += body[k]; k++; }
+        }
+        std::string low = ToLower(v.c_str());
+        if (low == "true" || low == "1" || low == "yes") { out = true; return true; }
+        if (low == "false" || low == "0" || low == "no") { out = false; return true; }
+        return false;
+    }
+    // Bare-литералы true/false.
+    if (body[k]=='t' || body[k]=='T') { out = true; return true; }
+    if (body[k]=='f' || body[k]=='F') { out = false; return true; }
+    // Число: не ноль = true.
+    int n = 0;
+    if (k+1 < body.size() && body[k]=='0' && (body[k+1]=='x'||body[k+1]=='X')) {
+        n = (int)strtol(body.c_str()+k, NULL, 16);
+    } else {
+        n = atoi(body.c_str()+k);
+    }
+    out = (n != 0);
+    return true;
+}
 static std::atomic<bool> g_httpRunning{false};
+static HANDLE g_httpWorkerSemaphore = NULL;
+static std::atomic<int> g_httpWorkersActive{0};
+static HANDLE g_httpThreadHandle = NULL;
 
 static void HttpSend(SOCKET s, const char* body, const char* contentType, int status = 200) {
     char hdr[512];
@@ -3014,7 +3188,7 @@ struct DashOpResult {
 static DashOpResult RunDashOp(DashOp* op) {
     DashOpResult result = {false, true, ""};
     op->doneEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    op->timedOut = false;
+    op->timedOut.store(false);
     if (!op->doneEvent) { result.error = "CreateEvent failed"; return result; }
     if (!PostMessageW(g_hMsgWindow, WM_DASH_OP, (WPARAM)op, 0)) {
         CloseHandle(op->doneEvent);
@@ -3030,7 +3204,7 @@ static DashOpResult RunDashOp(DashOp* op) {
     }
     // Timeout: mark as abandoned. MsgWndProc will delete it after processing.
     // We must NOT delete op here — main thread may still use it.
-    op->timedOut = true;
+    op->timedOut.store(true);
     result.callerOwnsOp = false;
     result.error = "timeout";
     return result;
@@ -3039,14 +3213,14 @@ static DashOpResult RunDashOp(DashOp* op) {
 // =====================================================================
 //  Phase 4: SSE (Server-Sent Events) for live dashboard updates
 // =====================================================================
-// H2: клиенты ограничены сверху (kMaxSseClients) и помечаются dead-флагом,
-// когда push-путь видит сбой send(). Сокет закрывает ТОЛЬКО поток-владелец
-// (SseClientThread) — main thread (hot path ProcessReport) делает лишь
-// ограниченный по времени send() и никогда не закрывает чужие сокеты.
+// H2: сокеты клиентов переводятся в non-blocking (FIONBIO) после рукопожатия.
+// Push-путь (hot path ProcessReport) шлёт send() без блокировки; при сбое
+// (SOCKET_ERROR / short send / WSAEWOULDBLOCK) pusher закрывает сокет и стирает
+// запись ПОД g_csRevision. Поток-владелец (SseClientThread) следит за наличием
+// своей записи и, если pusher уже стёр её, не закрывает сокет повторно.
 static const int kMaxSseClients = 8;
 struct SseClient {
     SOCKET socket;
-    bool dead;
 };
 static std::vector<SseClient> g_sseClients;
 static int g_sseClientCount = 0;
@@ -3054,54 +3228,47 @@ static int g_sseClientCount = 0;
 // NotifySseClients — отправить revision update всем подключённым SSE клиентам.
 // Вызывается из BumpRevision() при каждом state change.
 void NotifySseClients(unsigned long long revision) {
-    EnterCriticalSection(&g_csRevision);
-    std::vector<SseClient> clients = g_sseClients;
-    LeaveCriticalSection(&g_csRevision);
-
     char msg[128];
     int len = snprintf(msg, sizeof(msg), "event: revision\ndata: {\"revision\":%llu}\n\n", revision);
     if (len <= 0) return;
 
-    // H2: send() выполняется на hot path main thread — SO_SNDTIMEO (~200ms,
-    // задан в SseClientThread) ограничивает каждый send. Клиент, который не
-    // читает, помечается dead и удаляется из списка; его поток закроет сокет.
-    for (std::size_t i = 0; i < clients.size(); ++i) {
-        if (clients[i].dead) continue;
-        int sr = send(clients[i].socket, msg, len, 0);
+    // H2: send() на hot path выполняется на non-blocking сокете и возвращается
+    // сразу. Любой сбой (SOCKET_ERROR, короткий send, WSAEWOULDBLOCK) = клиент
+    // не успевает читать → закрываем сокет и стираем запись ПОД локом.
+    EnterCriticalSection(&g_csRevision);
+    for (std::size_t i = 0; i < g_sseClients.size(); ) {
+        SseClient& c = g_sseClients[i];
+        int sr = send(c.socket, msg, len, 0);
         if (sr == SOCKET_ERROR || sr != len) {
-            EnterCriticalSection(&g_csRevision);
-            for (std::size_t k = 0; k < g_sseClients.size(); ++k) {
-                if (g_sseClients[k].socket == clients[i].socket) {
-                    g_sseClients[k].dead = true;
-                    break;
-                }
-            }
-            LeaveCriticalSection(&g_csRevision);
+            closesocket(c.socket);
+            g_sseClients.erase(g_sseClients.begin() + i);
+            g_sseClientCount--;
+            Log("SSE client dropped (revision send failed)");
+        } else {
+            ++i;
         }
     }
+    LeaveCriticalSection(&g_csRevision);
 }
 
 // Live-экран: пуш "event: activity" всем SSE-клиентам (json уже готов).
 static void NotifyActivitySse(const std::string& json) {
-    EnterCriticalSection(&g_csRevision);
-    std::vector<SseClient> clients = g_sseClients;
-    LeaveCriticalSection(&g_csRevision);
-    if (clients.empty()) return;
     std::string msg = "event: activity\ndata: " + json + "\n\n";
-    for (std::size_t i = 0; i < clients.size(); ++i) {
-        if (clients[i].dead) continue;
-        int sr = send(clients[i].socket, msg.c_str(), (int)msg.size(), 0);
+    // H2: non-blocking send под локом; сбой → закрыть сокет и стереть запись.
+    EnterCriticalSection(&g_csRevision);
+    for (std::size_t i = 0; i < g_sseClients.size(); ) {
+        SseClient& c = g_sseClients[i];
+        int sr = send(c.socket, msg.c_str(), (int)msg.size(), 0);
         if (sr == SOCKET_ERROR || sr != (int)msg.size()) {
-            EnterCriticalSection(&g_csRevision);
-            for (std::size_t k = 0; k < g_sseClients.size(); ++k) {
-                if (g_sseClients[k].socket == clients[i].socket) {
-                    g_sseClients[k].dead = true;
-                    break;
-                }
-            }
-            LeaveCriticalSection(&g_csRevision);
+            closesocket(c.socket);
+            g_sseClients.erase(g_sseClients.begin() + i);
+            g_sseClientCount--;
+            Log("SSE client dropped (activity send failed)");
+        } else {
+            ++i;
         }
     }
+    LeaveCriticalSection(&g_csRevision);
 }
 
 // Параметры для SseClientThread (heap — поток сам освобождает).
@@ -3131,32 +3298,39 @@ static DWORD WINAPI SseClientThread(LPVOID parameter) {
     DWORD sndTimeoutMs = 200;
     setsockopt(cli, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTimeoutMs, sizeof(sndTimeoutMs));
 
-    // M6: эхо Origin запроса (loopback) — SSE работает и для 127.0.0.1, и для
-    // localhost; "*" для клиентов без Origin (curl/скрипты).
+    // M6: Origin эхо-заголовок выводим только если Origin разрешён
+    // (keysidekick::IsAllowedOrigin) — никогда не шлём "*".
     std::string headers =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
         "Cache-Control: no-cache\r\n"
-        "Connection: keep-alive\r\n"
-        "Access-Control-Allow-Origin: " + origin + "\r\n"
-        "\r\n";
+        "Connection: keep-alive\r\n";
+    if (!origin.empty()) {
+        headers += "Access-Control-Allow-Origin: " + origin + "\r\n";
+    }
+    headers += "\r\n";
     send(cli, headers.c_str(), (int)headers.size(), 0);
 
+    unsigned long long initRev;
+    EnterCriticalSection(&g_csRevision); initRev = g_stateRevision; LeaveCriticalSection(&g_csRevision);
     char initMsg[128];
     int initLen = snprintf(initMsg, sizeof(initMsg),
-        "event: revision\ndata: {\"revision\":%llu}\n\n", g_stateRevision);
+        "event: revision\ndata: {\"revision\":%llu}\n\n", initRev);
     send(cli, initMsg, initLen, 0);
+
+    // H2: после рукопожатия переводим сокет в non-blocking, затем регистрируем.
+    u_long nb = 1;
+    ioctlsocket(cli, FIONBIO, &nb);
 
     EnterCriticalSection(&g_csRevision);
     g_sseClients.push_back(SseClient());
     g_sseClients.back().socket = cli;
-    g_sseClients.back().dead = false;
     g_sseClientCount++;
     LeaveCriticalSection(&g_csRevision);
     Log("SSE client connected (%d total)", g_sseClientCount);
 
-    bool dead = false;
-    while (g_running && !dead) {
+    DWORD lastPing = GetTickCount();
+    while (g_running) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(cli, &fds);
@@ -3165,29 +3339,49 @@ static DWORD WINAPI SseClientThread(LPVOID parameter) {
         tv.tv_usec = 0;
         int sel = select(0, &fds, NULL, NULL, &tv);
         if (sel == SOCKET_ERROR) break;
+        if (sel == 0 && GetTickCount() - lastPing >= 15000) {
+            // keepalive-фрейм: не даём промежуточным прокси/таймаутам убить стрим.
+            if (send(cli, ": ping\n\n", 8, 0) == SOCKET_ERROR) break;
+            lastPing = GetTickCount();
+        }
         if (sel > 0) {
             char buf[64];
             int r = recv(cli, buf, sizeof(buf), 0);
             if (r <= 0) break;
         }
-        // H2: push-путь мог пометить нас dead (send timeout / peer не читает).
-        // Сокет закрываем здесь, в потоке-владельце.
+        // H2: если pusher уже закрыл сокет и стёр нашу запись (send failure) —
+        // выходим без повторного closesocket.
         EnterCriticalSection(&g_csRevision);
+        bool registered = false;
         for (std::size_t i = 0; i < g_sseClients.size(); ++i) {
-            if (g_sseClients[i].socket == cli) { dead = g_sseClients[i].dead; break; }
+            if (g_sseClients[i].socket == cli) { registered = true; break; }
         }
         LeaveCriticalSection(&g_csRevision);
+        if (!registered) break;
     }
 
+    // H2: закрываем сокет только если запись всё ещё наша. Если pusher уже
+    // стёр её (send failure) — сокет уже закрыт, повторно не закрываем.
+    bool owned = false;
     EnterCriticalSection(&g_csRevision);
-    g_sseClients.erase(std::remove_if(g_sseClients.begin(), g_sseClients.end(),
-        [cli](const SseClient& c) { return c.socket == cli; }), g_sseClients.end());
-    g_sseClientCount--;
+    for (std::size_t i = 0; i < g_sseClients.size(); ++i) {
+        if (g_sseClients[i].socket == cli) {
+            g_sseClients.erase(g_sseClients.begin() + i);
+            g_sseClientCount--;
+            owned = true;
+            break;
+        }
+    }
     LeaveCriticalSection(&g_csRevision);
-    Log("SSE client disconnected (%d total)", g_sseClientCount);
-    closesocket(cli);
+    if (owned) {
+        Log("SSE client disconnected (%d total)", g_sseClientCount);
+        closesocket(cli);
+    }
     return 0;
 }
+
+static void HandleHttpConnection(SOCKET cli);
+static DWORD WINAPI HttpWorkerThread(LPVOID parameter);
 
 static DWORD WINAPI HttpThread(LPVOID) {
     WSADATA wsa;
@@ -3205,1455 +3399,1532 @@ static DWORD WINAPI HttpThread(LPVOID) {
     }
     if (listen(srv, 5) == SOCKET_ERROR) { Log("HTTP listen failed"); closesocket(srv); return 1; }
     Log("HTTP listening on 127.0.0.1:%d", g_httpPort);
-
     while (g_httpRunning) {
+
+        // H3: select-timeout accept — быстрый выход при остановке (join на exit).
+        fd_set afds;
+        FD_ZERO(&afds);
+        FD_SET(srv, &afds);
+        struct timeval atv;
+        atv.tv_sec = 0;
+        atv.tv_usec = 500000;
+        int asel = select(0, &afds, NULL, NULL, &atv);
+        if (asel == SOCKET_ERROR) break;
+        if (asel == 0) continue;
         SOCKET cli = accept(srv, NULL, NULL);
         if (cli == INVALID_SOCKET) break;
-
-        // H1/H2: per-connection timeouts. SO_RCVTIMEO (5s) keeps one idle or
-        // slow local client from stalling the only HTTP thread forever;
-        // SO_SNDTIMEO (10s) bounds the response send (the embedded dashboard
-        // HTML is ~600 KB — a client that connects and never reads must not
-        // block the thread indefinitely either). SSE resets SO_SNDTIMEO to
-        // ~200ms in its own thread (H2).
-        DWORD rcvTimeoutMs = 5000;
-        setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTimeoutMs, sizeof(rcvTimeoutMs));
-        DWORD sndTimeoutMs = 10000;
-        setsockopt(cli, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTimeoutMs, sizeof(sndTimeoutMs));
-
-        // Накопить запрос: читать до \r\n\r\n (конец заголовков), потом body по Content-Length.
-        // H1 design decision: single-threaded HTTP server. Each recv is bounded
-        // by SO_RCVTIMEO and the WHOLE request by a 15s deadline, so a slow
-        // drip cannot monopolize the thread. Requests larger than 64 KiB are
-        // rejected (431 for headers / 413 for body) BEFORE any parsing, and a
-        // truncated (timed-out) read is never processed — partial JSON with
-        // defaulted fields is a real bug class (see M5).
-        std::string req;
-        char buf[2048];
-        size_t headerEnd = std::string::npos;
-        int contentLength = 0;
-        std::string hostHeader;
-        std::string csrfHeader;
-        std::string originHeader;
-        std::string contentTypeHeader;
-        std::string secFetchSiteHeader;
-        const size_t kMaxRequestBytes = 64 * 1024;
-        bool requestTooLarge = false;
-        bool truncatedRead = false;
-        const ULONGLONG requestDeadline = GetTickCount64() + 15000;
-        while (g_httpRunning) {
-            if (GetTickCount64() > requestDeadline) { truncatedRead = true; break; }
-            int r = recv(cli, buf, sizeof(buf), 0);
-            if (r == SOCKET_ERROR) {
-                // SO_RCVTIMEO expired mid-request (or transport error) —
-                // partial input is unsafe to parse.
-                truncatedRead = true;
-                break;
-            }
-            if (r <= 0) break;   // peer closed cleanly
-            req.append(buf, r);
-            if (req.size() > kMaxRequestBytes) { requestTooLarge = true; break; }
-            if (headerEnd == std::string::npos) {
-                headerEnd = req.find("\r\n\r\n");
-                if (headerEnd != std::string::npos) {
-                    // парсить заголовки (Host, Content-Length, token, Origin, Content-Type, Sec-Fetch-Site)
-                    std::string headers = req.substr(0, headerEnd);
-                    size_t pos = 0;
-                    while (pos < headers.size()) {
-                        size_t eol = headers.find("\r\n", pos);
-                        if (eol == std::string::npos) eol = headers.size();
-                        std::string line = headers.substr(pos, eol - pos);
-                        if (_strnicmp(line.c_str(), "Host:", 5) == 0) {
-                            hostHeader = line.substr(5);
-                            while (!hostHeader.empty() && (hostHeader.front()==' '||hostHeader.front()=='\t')) hostHeader.erase(0,1);
-                        } else if (_strnicmp(line.c_str(), "Content-Length:", 15) == 0) {
-                            contentLength = atoi(line.c_str()+15);
-                        } else if (_strnicmp(line.c_str(), "X-KeySidekick-Token:", 20) == 0) {
-                            csrfHeader = line.substr(20);
-                            while (!csrfHeader.empty() && (csrfHeader.front()==' '||csrfHeader.front()=='\t')) csrfHeader.erase(0,1);
-                        } else if (_strnicmp(line.c_str(), "Origin:", 7) == 0) {
-                            originHeader = line.substr(7);
-                            while (!originHeader.empty() && (originHeader.front()==' '||originHeader.front()=='\t')) originHeader.erase(0,1);
-                        } else if (_strnicmp(line.c_str(), "Content-Type:", 13) == 0) {
-                            contentTypeHeader = line.substr(13);
-                            while (!contentTypeHeader.empty() && (contentTypeHeader.front()==' '||contentTypeHeader.front()=='\t')) contentTypeHeader.erase(0,1);
-                        } else if (_strnicmp(line.c_str(), "Sec-Fetch-Site:", 15) == 0) {
-                            secFetchSiteHeader = line.substr(15);
-                            while (!secFetchSiteHeader.empty() && (secFetchSiteHeader.front()==' '||secFetchSiteHeader.front()=='\t')) secFetchSiteHeader.erase(0,1);
-                        }
-                        pos = eol + 2;
-                    }
-                }
-            }
-            if (headerEnd != std::string::npos) {
-                size_t bodyHave = req.size() - (headerEnd + 4);
-                if ((int)bodyHave >= contentLength) break;   // всё тело прочитано
-            }
+        // H3: ограниченный пул воркеров (8): slowloris больше не блокирует
+        // дашборд; переполнение пула — мгновенный отказ соединения.
+        if (WaitForSingleObject(g_httpWorkerSemaphore, 0) != WAIT_OBJECT_0) {
+            closesocket(cli);
+            continue;
         }
-        if (req.empty() || truncatedRead) { closesocket(cli); continue; }
-        if (requestTooLarge) {
-            // 431 если переполнились заголовки, 413 если тело.
-            HttpSend(cli, "request too large", "text/plain",
-                     headerEnd == std::string::npos ? 431 : 413);
-            closesocket(cli); continue;
+        g_httpWorkersActive.fetch_add(1);
+        HANDLE worker = CreateThread(NULL, 0, HttpWorkerThread,
+                                     (LPVOID)(ULONG_PTR)cli, 0, NULL);
+        if (worker == NULL) {
+            g_httpWorkersActive.fetch_sub(1);
+            ReleaseSemaphore(g_httpWorkerSemaphore, 1, NULL);
+            closesocket(cli);
+            continue;
         }
-
-        // Парсим request line
-        std::string method, path, query;
-        size_t sp1 = req.find(' ');
-        if (sp1 == std::string::npos) { HttpSend(cli, "bad request", "text/plain", 400); closesocket(cli); continue; }
-        method = req.substr(0, sp1);
-        size_t sp2 = req.find(' ', sp1+1);
-        std::string url = (sp2 != std::string::npos) ? req.substr(sp1+1, sp2-sp1-1) : req.substr(sp1+1);
-        size_t qp = url.find('?');
-        if (qp != std::string::npos) { path = url.substr(0, qp); query = url.substr(qp+1); }
-        else path = url;
-
-        std::string body = (headerEnd != std::string::npos) ? req.substr(headerEnd+4) : "";
-
-        // C1: роутим КАЖДЫЙ запрос через http_security pipeline.
-        // ValidateDashboardRequest (http_security.cpp, покрыт unit-тестами)
-        // enforce: loopback Host/Origin, Sec-Fetch-Site, header/body caps,
-        // mutating-GET → 405, и для mutating методов — CSRF token (403) +
-        // Content-Type: application/json (415). Это заменяет старый ad-hoc
-        // "POST ⇒ token" gate, который GET /switch и GET /profile обходили.
-        {
-            keysidekick::RequestMetadata meta;
-            meta.method = method;
-            meta.path = path;
-            meta.host = hostHeader;
-            // Голый Host (без порта) legacy-сервер терпел; нормализуем, чтобы
-            // строгий loopback-check в pipeline его тоже принял.
-            if (meta.host.find(':') == std::string::npos)
-                meta.host += ":" + std::to_string(g_httpPort);
-            meta.origin = originHeader;
-            meta.sec_fetch_site = secFetchSiteHeader;
-            meta.content_type = contentTypeHeader;
-            meta.token_header_name = "X-KeySidekick-Token";
-            meta.token_header = csrfHeader;
-            meta.header_bytes = (headerEnd != std::string::npos) ? headerEnd + 4 : req.size();
-            meta.body_bytes = body.size();
-
-            keysidekick::SecurityPolicy policy;
-            policy.port = (unsigned short)g_httpPort;
-            policy.allow_ipv6_loopback = false;
-            policy.token_header_name = "X-KeySidekick-Token";
-            policy.token = g_csrfToken;
-            policy.max_header_bytes = keysidekick::kDefaultMaxHeaderBytes;
-            policy.max_body_bytes = keysidekick::kDefaultMaxBodyBytes;
-
-            keysidekick::SecurityDecision decision =
-                keysidekick::ValidateDashboardRequest(meta, policy);
-            if (!decision.allowed) {
-                HttpSendJson(cli,
-                    std::string("{\"error\":\"") + JsonEscape(decision.message) +
-                    "\",\"code\":\"" + decision.code + "\"}",
-                    decision.http_status);
-                closesocket(cli); continue;
-            }
-        }
-
-        // C1: legacy mutating GETs (/switch, /profile) отклоняются намертво —
-        // канонический API переключения: POST /api/profile/activate.
-        if ((method == "GET" || method == "HEAD") &&
-            (path == "/switch" || path == "/profile")) {
-            HttpSendJson(cli,
-                "{\"error\":\"state changes require POST /api/profile/activate\",\"code\":\"mutating_get_forbidden\"}", 405);
-            closesocket(cli); continue;
-        }
-
-        // --- Routing ---
-        // favicon.ico — return empty 204 to avoid 404 noise in browser console
-        if (method == "GET" && path == "/favicon.ico") {
-            HttpSend(cli, "", "image/x-icon", 204);
-        }
-        else if (method == "GET" && path == "/") {
-            // Phase 4: inject CSRF token into dashboard HTML.
-            // kDashboardHtml содержит маркер /*{{CSRF_TOKEN}}*/ который заменяется на реальный token.
-            std::string html(kDashboardHtml, kDashboardHtmlSize);
-            const std::string marker = "/*{{CSRF_TOKEN}}*/\"\"";
-            size_t pos = html.find(marker);
-            if (pos != std::string::npos) {
-                html.replace(pos, marker.size(), "\"" + g_csrfToken + "\"");
-            }
-            // Also expose state revision for SSE bootstrap
-            const std::string revMarker = "/*{{STATE_REVISION}}*/\"0\"";
-            size_t rpos = html.find(revMarker);
-            if (rpos != std::string::npos) {
-                char revBuf[32]; snprintf(revBuf, sizeof(revBuf), "%llu", g_stateRevision);
-                html.replace(rpos, revMarker.size(), std::string("\"") + revBuf + "\"");
-            }
-            HttpSend(cli, html.c_str(), "text/html; charset=utf-8");
-        }
-        // GET /api/status
-        else if (method == "GET" && path == "/api/status") {
-            bool dev = (g_hWinUsb != NULL);
-            std::string active;
-            EnterCriticalSection(&g_csProfile); active = g_activeProfile; LeaveCriticalSection(&g_csProfile);
-            char j[256];
-            snprintf(j, sizeof(j), "{\"device\":\"%s\",\"active\":\"%s\",\"http\":%s,\"tray\":%s}",
-                dev ? "connected" : "disconnected", active.c_str(),
-                g_httpEnabled ? "true" : "false", g_trayEnabled ? "true" : "false");
-            HttpSendJson(cli, j);
-        }
-        // GET /api/v1/state — unified snapshot with revision (Phase 4)
-        // SSE clients fetch this after receiving event:revision to get full state
-        else if (method == "GET" && path == "/api/v1/state") {
-            bool dev = (g_hWinUsb != NULL);
-            std::string active;
-            unsigned long long rev;
-            size_t profileCount, appCount;
-            EnterCriticalSection(&g_csProfile);
-            active = g_activeProfile;
-            profileCount = g_profiles.size();
-            appCount = g_domain.applications.size();
-            LeaveCriticalSection(&g_csProfile);
-            EnterCriticalSection(&g_csRevision); rev = g_stateRevision; LeaveCriticalSection(&g_csRevision);
-            char j[512];
-            snprintf(j, sizeof(j),
-                "{\"version\":\"%s\",\"revision\":%llu,\"device\":\"%s\",\"active\":\"%s\",\"http\":%s,\"tray\":%s,"
-                "\"profileCount\":%zu,\"appCount\":%zu}",
-                APP_VERSION, rev,
-                dev ? "connected" : "disconnected", active.c_str(),
-                g_httpEnabled ? "true" : "false", g_trayEnabled ? "true" : "false",
-                profileCount, appCount);
-            HttpSendJson(cli, j);
-        }
-        // GET /api/profiles (полный JSON всех профилей)
-        else if (method == "GET" && path == "/api/profiles") {
-            std::string j = "[";
-            EnterCriticalSection(&g_csProfile);
-            bool first = true;
-            for (auto& kv : g_profiles) {
-                if (!first) j += ",";
-                j += ProfileToJson(kv.second);
-                first = false;
-            }
-            std::string active = g_activeProfile;
-            LeaveCriticalSection(&g_csProfile);
-            j += "]";
-            // обернуть с active для удобства фронта
-            std::string wrap = "{\"active\":\"" + JsonEscape(active) + "\",\"profiles\":" + j + "}";
-            HttpSendJson(cli, wrap);
-        }
-        // GET /api/profile?name=X
-        else if (method == "GET" && path == "/api/profile") {
-            std::string name;
-            if (const char* p = strstr(query.c_str(), "name=")) {
-                name = p+5; size_t a = name.find('&'); if (a != std::string::npos) name = name.substr(0,a);
-            }
-            if (name.empty()) { HttpSendJson(cli, "{\"error\":\"missing name\"}", 400); }
-            else {
-                EnterCriticalSection(&g_csProfile);
-                auto it = g_profiles.find(name);
-                std::string j = (it != g_profiles.end()) ? ProfileToJson(it->second) : "{\"error\":\"not found\"}";
-                LeaveCriticalSection(&g_csProfile);
-                HttpSendJson(cli, j, (it != g_profiles.end()) ? 200 : 404);
-            }
-        }
-        // POST /api/profile/activate  body {"name":"X"}
-        // (C1: legacy GET /switch и GET /profile удалены — они мутировали state
-        //  без token/origin и теперь возвращают 405 выше по коду.)
-        else if (method == "POST" && path == "/api/profile/activate") {
-            std::string name;
-            JsonGetStr(body, "name", name);
-            if (name.empty()) {
-                // вернуть текущий (backwards-compat)
-                EnterCriticalSection(&g_csProfile); std::string cur = g_activeProfile; LeaveCriticalSection(&g_csProfile);
-                HttpSend(cli, cur.c_str(), "text/plain");
-            } else {
-                char* dup = _strdup(name.c_str());
-                PostMessageW(g_hMsgWindow, WM_HTTP_SWITCH, (WPARAM)dup, 0);
-                HttpSendJson(cli, "{\"ok\":true,\"switching\":\"" + JsonEscape(name) + "\"}");
-            }
-        }
-        // POST /api/key  body {profile, usage, mod, action} → ADD_KEY
-        else if (method == "POST" && path == "/api/key") {
-            std::string profile, action; int usage=0, mod=0;
-            JsonGetStr(body, "profile", profile);
-            JsonGetStr(body, "action", action);
-            JsonGetInt(body, "usage", usage);
-            JsonGetInt(body, "mod", mod);
-            if (profile.empty() || usage <= 0) { HttpSendJson(cli, "{\"error\":\"missing profile/usage\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_ADD_KEY;
-                strncpy(op->profile, profile.c_str(), 63);
-                op->usage = usage; op->mod = (unsigned char)mod;
-                strncpy(op->action, action.c_str(), 255);
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;            }
-        }
-        // POST /api/key/delete  body {profile, usage, mod} → REMOVE_KEY
-        else if (method == "POST" && path == "/api/key/delete") {
-            std::string profile; int usage=0, mod=0;
-            JsonGetStr(body, "profile", profile);
-            JsonGetInt(body, "usage", usage);
-            JsonGetInt(body, "mod", mod);
-            if (profile.empty() || usage <= 0) { HttpSendJson(cli, "{\"error\":\"missing profile/usage\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_REMOVE_KEY;
-                strncpy(op->profile, profile.c_str(), 63);
-                op->usage = usage; op->mod = (unsigned char)mod;
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;            }
-        }
-        // ---- Mapping management (in-place edit, reorder) ----
-        // POST /api/key/update — body {profile, usage, mod, newAction} → DASH_UPDATE_KEY
-        else if (method == "POST" && path == "/api/key/update") {
-            std::string profile, newAction; int usage=0, mod=0;
-            JsonGetStr(body, "profile", profile);
-            JsonGetStr(body, "newAction", newAction);
-            JsonGetInt(body, "usage", usage);
-            JsonGetInt(body, "mod", mod);
-            if (profile.empty() || usage <= 0 || newAction.empty()) { HttpSendJson(cli, "{\"error\":\"missing profile/usage/newAction\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_UPDATE_KEY;
-                strncpy(op->profile, profile.c_str(), 63);
-                op->usage = usage; op->mod = (unsigned char)mod;
-                strncpy(op->action, newAction.c_str(), 255);
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;
-            }
-        }
-        // POST /api/key/move — body {profile, usage, mod, direction} → DASH_MOVE_KEY (up/down swap)
-        else if (method == "POST" && path == "/api/key/move") {
-            std::string profile, dir; int usage=0, mod=0;
-            JsonGetStr(body, "profile", profile);
-            JsonGetStr(body, "direction", dir);
-            JsonGetInt(body, "usage", usage);
-            JsonGetInt(body, "mod", mod);
-            if (profile.empty() || usage <= 0) { HttpSendJson(cli, "{\"error\":\"missing profile/usage\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_MOVE_KEY;
-                strncpy(op->profile, profile.c_str(), 63);
-                op->usage = usage; op->mod = (unsigned char)mod;
-                strncpy(op->strArg1, dir.c_str(), 127);  // "up" or "down"
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;
-            }
-        }
-        // POST /api/key/duplicate — body {profile, usage, newUsage} → DASH_DUPLICATE_KEY
-        else if (method == "POST" && path == "/api/key/duplicate") {
-            std::string profile; int usage=0, mod=0, newUsage=0;
-            JsonGetStr(body, "profile", profile);
-            JsonGetInt(body, "usage", usage);
-            JsonGetInt(body, "mod", mod);
-            JsonGetInt(body, "newUsage", newUsage);
-            if (profile.empty() || usage <= 0 || newUsage <= 0) { HttpSendJson(cli, "{\"error\":\"missing profile/usage/newUsage\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_DUPLICATE_KEY;
-                strncpy(op->profile, profile.c_str(), 63);
-                op->usage = usage;
-                op->mod = (unsigned char)mod;
-                snprintf(op->strArg1, sizeof(op->strArg1), "%d", newUsage);
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;
-            }
-        }
-        // POST /api/profile  body {name, mode, targetClass, targetExe, targetPath, autoStart, layerMod} → SET_PROFILE
-        else if (method == "POST" && path == "/api/profile") {
-            std::string name, tCls, tExe, tPath, modeStr, layerMod; int autoStart=0;
-            JsonGetStr(body, "name", name);
-            JsonGetStr(body, "mode", modeStr);
-            JsonGetStr(body, "targetClass", tCls);
-            JsonGetStr(body, "targetExe", tExe);
-            JsonGetStr(body, "targetPath", tPath);
-            JsonGetStr(body, "layerMod", layerMod);
-            JsonGetInt(body, "autoStart", autoStart);
-            if (name.empty()) { HttpSendJson(cli, "{\"error\":\"missing name\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_SET_PROFILE;
-                strncpy(op->profile, name.c_str(), 63);
-                op->mode = (modeStr == "basic") ? 0 : 1;
-                strncpy(op->targetClass, tCls.c_str(), 255);
-                strncpy(op->targetExe, tExe.c_str(), 255);
-                strncpy(op->targetPath, tPath.c_str(), 511);
-                strncpy(op->layerMod, layerMod.c_str(), 15);
-                op->layerMod[15] = 0;
-                op->autoStart = autoStart ? 1 : 0;
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;            }
-        }
-        // POST /api/reload → ReloadConfig
-        else if (method == "POST" && path == "/api/reload") {
-            DashOp* op = new DashOp();
-            op->op = DASH_RELOAD;
-            DashOpResult rr = RunDashOp(op);
-            if (rr.callerOwnsOp) delete op;
-            HttpSendJson(cli, rr.ok ? "{\"ok\":true}" : "{\"error\":\"reload failed\"}", rr.ok ? 200 : 500);
-        }
-        // ---- Phase 2: multi-app CRUD endpoints (additive, no changes to existing) ----
-        // GET /api/v1/applications — список ApplicationTargets
-        else if (method == "GET" && path == "/api/v1/applications") {
-            std::string j = "{\"applications\":[";
-            EnterCriticalSection(&g_csProfile);
-            bool first = true;
-            for (std::size_t i = 0; i < g_domain.applications.size(); ++i) {
-                const keysidekick::ApplicationTarget& app = g_domain.applications[i];
-                if (!first) j += ",";
-                first = false;
-                j += "{\"id\":\"" + JsonEscape(app.id()) + "\"";
-                j += ",\"name\":\"" + JsonEscape(app.name) + "\"";
-                j += ",\"windowClass\":\"" + JsonEscape(app.windowClass) + "\"";
-                j += ",\"exePath\":\"" + JsonEscape(app.exePath) + "\"";
-                j += ",\"processName\":\"" + JsonEscape(app.processName) + "\"";
-                j += "}";
-            }
-            LeaveCriticalSection(&g_csProfile);
-            j += "]}";
-            HttpSendJson(cli, j);
-        }
-        // POST /api/v1/profile/create — {id, name, mode}
-        else if (method == "POST" && path == "/api/v1/profile/create") {
-            std::string id, name, modeStr;
-            JsonGetStr(body, "id", id);
-            JsonGetStr(body, "name", name);
-            JsonGetStr(body, "mode", modeStr);
-            if (id.empty()) { HttpSendJson(cli, "{\"error\":\"missing id\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_CREATE_PROFILE;
-                strncpy(op->profile, id.c_str(), 63);
-                strncpy(op->strArg1, name.c_str(), 127);
-                op->mode = (modeStr == "targeted") ? 1 : 0;
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;            }
-        }
-        // POST /api/v1/profile/delete — {id}
-        else if (method == "POST" && path == "/api/v1/profile/delete") {
-            std::string id;
-            JsonGetStr(body, "id", id);
-            if (id.empty()) { HttpSendJson(cli, "{\"error\":\"missing id\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_DELETE_PROFILE;
-                strncpy(op->profile, id.c_str(), 63);
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;            }
-        }
-        // POST /api/v1/profile/rename — {id, newName}
-        else if (method == "POST" && path == "/api/v1/profile/rename") {
-            std::string id, newName;
-            JsonGetStr(body, "id", id);
-            JsonGetStr(body, "newName", newName);
-            if (id.empty() || newName.empty()) { HttpSendJson(cli, "{\"error\":\"missing id/newName\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_RENAME_PROFILE;
-                strncpy(op->profile, id.c_str(), 63);
-                strncpy(op->strArg1, newName.c_str(), 127);
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;            }
-        }
-        // POST /api/v1/profile/duplicate — {sourceId, newId, newName}
-        else if (method == "POST" && path == "/api/v1/profile/duplicate") {
-            std::string sourceId, newId, newName;
-            JsonGetStr(body, "sourceId", sourceId);
-            JsonGetStr(body, "newId", newId);
-            JsonGetStr(body, "newName", newName);
-            if (sourceId.empty() || newId.empty()) { HttpSendJson(cli, "{\"error\":\"missing sourceId/newId\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_DUPLICATE_PROFILE;
-                strncpy(op->profile, sourceId.c_str(), 63);
-                strncpy(op->strArg1, newId.c_str(), 127);
-                strncpy(op->strArg2, newName.c_str(), 127);
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;            }
-        }
-        // POST /api/v1/profile/link-app — {profileId, appId}
-        else if (method == "POST" && path == "/api/v1/profile/link-app") {
-            std::string profileId, appId;
-            JsonGetStr(body, "profileId", profileId);
-            JsonGetStr(body, "appId", appId);
-            if (profileId.empty() || appId.empty()) { HttpSendJson(cli, "{\"error\":\"missing profileId/appId\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_LINK_APP;
-                strncpy(op->profile, profileId.c_str(), 63);
-                strncpy(op->strArg1, appId.c_str(), 127);
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;            }
-        }
-        // POST /api/v1/profile/unlink-app — {profileId, appId}
-        else if (method == "POST" && path == "/api/v1/profile/unlink-app") {
-            std::string profileId, appId;
-            JsonGetStr(body, "profileId", profileId);
-            JsonGetStr(body, "appId", appId);
-            if (profileId.empty() || appId.empty()) { HttpSendJson(cli, "{\"error\":\"missing profileId/appId\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_UNLINK_APP;
-                strncpy(op->profile, profileId.c_str(), 63);
-                strncpy(op->strArg1, appId.c_str(), 127);
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;            }
-        }
-        // POST /api/v1/profile/set-default-app — {profileId, appId}
-        else if (method == "POST" && path == "/api/v1/profile/set-default-app") {
-            std::string profileId, appId;
-            JsonGetStr(body, "profileId", profileId);
-            JsonGetStr(body, "appId", appId);
-            if (profileId.empty()) { HttpSendJson(cli, "{\"error\":\"missing profileId\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_SET_DEFAULT_APP;
-                strncpy(op->profile, profileId.c_str(), 63);
-                strncpy(op->strArg1, appId.c_str(), 127);
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if(rr.callerOwnsOp) delete op;            }
-        }
-        // ---- Phase 3: window discovery + application resolver ----
-        // GET /api/v1/windows — список запущенных top-level окон для visual picker
-        else if (method == "GET" && path == "/api/v1/windows") {
-            keysidekick::windows_targets::WindowFilterPolicy policy;
-            policy.requireVisible = true;
-            policy.excludeEmptyTitles = true;
-            policy.excludeToolWindows = true;
-            policy.excludeShellWindows = true;
-            std::vector<keysidekick::windows_targets::WindowCandidate> windows =
-                keysidekick::windows_targets::EnumerateWindows(policy);
-
-            std::string j = "{\"windows\":[";
-            bool first = true;
-            for (std::size_t i = 0; i < windows.size(); ++i) {
-                const auto& w = windows[i];
-                // Convert wstrings to UTF-8 for JSON
-                auto toUtf8 = [](const std::wstring& ws) -> std::string {
-                    if (ws.empty()) return std::string();
-                    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
-                    std::string s(len, 0);
-                    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], len, NULL, NULL);
-                    return s;
-                };
-                if (!first) j += ",";
-                first = false;
-                char header[128];
-                snprintf(header, sizeof(header), "{\"hwnd\":%lu,\"pid\":%lu,\"title\":\"",
-                    (unsigned long)w.handle, (unsigned long)w.processId);
-                j += header;
-                j += JsonEscape(toUtf8(w.title));
-                j += "\",\"windowClass\":\"";
-                j += JsonEscape(toUtf8(w.windowClass));
-                j += "\",\"processName\":\"";
-                j += JsonEscape(toUtf8(w.processName));
-                j += "\",\"processPath\":\"";
-                j += JsonEscape(toUtf8(w.processPath));
-                j += "\"}";
-            }
-            j += "]}";
-            HttpSendJson(cli, j);
-        }
-        // GET /api/v1/windows/foreground — current foreground window info (TinyWall-style pick)
-        else if (method == "GET" && path == "/api/v1/windows/foreground") {
-            HWND fg = GetForegroundWindow();
-            if (!fg) {
-                HttpSendJson(cli, "{\"found\":false,\"reason\":\"no foreground window\"}");
-                closesocket(cli);
-                continue;
-            }
-            wchar_t title[512] = {0};
-            wchar_t cls[256] = {0};
-            GetWindowTextW(fg, title, 512);
-            GetClassNameW(fg, cls, 256);
-            DWORD pid = 0;
-            GetWindowThreadProcessId(fg, &pid);
-            // Get process name
-            std::wstring procName;
-            HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-            if (hProc) {
-                wchar_t procPath[MAX_PATH] = {0};
-                DWORD sz = MAX_PATH;
-                if (QueryFullProcessImageNameW(hProc, 0, procPath, &sz)) {
-                    procName = procPath;
-                    // Extract just the filename
-                    std::size_t slash = procName.find_last_of(L'\\');
-                    if (slash != std::wstring::npos) procName = procName.substr(slash + 1);
-                }
-                CloseHandle(hProc);
-            }
-            // Convert to UTF-8
-            auto toUtf8 = [](const std::wstring& ws) -> std::string {
-                if (ws.empty()) return std::string();
-                int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
-                std::string s(len, 0);
-                WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], len, NULL, NULL);
-                return s;
-            };
-            char j[2048];
-            snprintf(j, sizeof(j),
-                "{\"found\":true,\"hwnd\":%lu,\"pid\":%lu,\"title\":\"%s\",\"windowClass\":\"%s\",\"processName\":\"%s\"}",
-                (unsigned long)(ULONG_PTR)fg, (unsigned long)pid,
-                JsonEscape(toUtf8(title)).c_str(),
-                JsonEscape(toUtf8(cls)).c_str(),
-                JsonEscape(toUtf8(procName)).c_str());
-            HttpSendJson(cli, j);
-        }
-        // POST /api/v1/windows/foreground/pick — pick the foreground window as target for a profile
-        // (Equivalent to writing the foreground info into the profile editor)
-        else if (method == "POST" && path == "/api/v1/windows/foreground/pick") {
-            HWND fg = GetForegroundWindow();
-            if (!fg) {
-                HttpSendJson(cli, "{\"found\":false}", 400);
-                closesocket(cli);
-                continue;
-            }
-            wchar_t title[512] = {0};
-            wchar_t cls[256] = {0};
-            GetWindowTextW(fg, title, 512);
-            GetClassNameW(fg, cls, 256);
-            DWORD pid = 0;
-            GetWindowThreadProcessId(fg, &pid);
-            std::wstring procName;
-            std::wstring exePath;
-            HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-            if (hProc) {
-                wchar_t pp[MAX_PATH] = {0};
-                DWORD sz = MAX_PATH;
-                if (QueryFullProcessImageNameW(hProc, 0, pp, &sz)) {
-                    exePath = pp;
-                    std::size_t sl = exePath.find_last_of(L'\\');
-                    if (sl != std::wstring::npos) procName = exePath.substr(sl + 1);
-                }
-                CloseHandle(hProc);
-            }
-            // Return the fields the UI needs to fill the editor
-            auto toUtf8 = [](const std::wstring& ws) -> std::string {
-                if (ws.empty()) return std::string();
-                int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
-                std::string s(len, 0);
-                WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], len, NULL, NULL);
-                return s;
-            };
-            std::string rTitle, rClass, rProc, rPath;
-            rTitle = toUtf8(title);
-            rClass = toUtf8(cls);
-            rProc = toUtf8(procName);
-            rPath = toUtf8(exePath);
-            char j[2048];
-            snprintf(j, sizeof(j),
-                "{\"found\":true,\"title\":\"%s\",\"windowClass\":\"%s\",\"processName\":\"%s\",\"processPath\":\"%s\"}",
-                JsonEscape(rTitle).c_str(), JsonEscape(rClass).c_str(),
-                JsonEscape(rProc).c_str(), JsonEscape(rPath).c_str());
-            HttpSendJson(cli, j);
-        }
-        // POST /api/v1/applications/create — {name, windowClass, exePath, processName}
-        else if (method == "POST" && path == "/api/v1/applications/create") {
-            std::string name, windowClass, exePath, processName;
-            JsonGetStr(body, "name", name);
-            JsonGetStr(body, "windowClass", windowClass);
-            JsonGetStr(body, "exePath", exePath);
-            JsonGetStr(body, "processName", processName);
-            if (name.empty()) { HttpSendJson(cli, "{\"error\":\"missing name\"}", 400); }
-            else {
-                EnterCriticalSection(&g_csProfile);
-                // Generate safe application id from name
-                std::string appId = std::string("app-") + name;
-                for (char& c : appId) {
-                    if (!(std::isalnum((unsigned char)c) || c == '-' || c == '_')) c = '_';
-                }
-                // Ensure uniqueness
-                std::string baseId = appId;
-                int suffix = 2;
-                while (g_domain.findApplication(appId)) {
-                    char buf[16]; snprintf(buf, sizeof(buf), "%d", suffix++);
-                    appId = baseId + "-" + buf;
-                }
-                g_domain.applications.push_back(keysidekick::ApplicationTarget(appId, name));
-                keysidekick::ApplicationTarget& app = g_domain.applications.back();
-                app.windowClass = windowClass;
-                app.exePath = exePath;
-                app.processName = processName;
-                LeaveCriticalSection(&g_csProfile);
-
-                WriteConfig();
-                BumpRevision();
-
-                std::string resp = "{\"ok\":true,\"id\":\"" + JsonEscape(appId) + "\"}";
-                HttpSendJson(cli, resp);
-            }
-        }
-        // GET /api/v1/presets — каталог AI-agent панелей
-        else if (method == "GET" && path == "/api/v1/presets") {
-            int n = (int)(sizeof(kAgentPresets)/sizeof(kAgentPresets[0]));
-            std::string j = "{\"presets\":[";
-            for (int i = 0; i < n; ++i) {
-                const AgentPreset& p = kAgentPresets[i];
-                if (i) j += ",";
-                j += "{\"agentId\":\"" + std::string(p.agentId) + "\"";
-                j += ",\"name\":\"" + JsonEscape(p.name) + "\"";
-                j += ",\"description\":\"" + JsonEscape(p.desc) + "\"";
-                j += ",\"kind\":\"" + std::string(p.kind) + "\"";
-                j += ",\"mode\":\"" + std::string(p.profileMode) + "\"";
-                j += ",\"keys\":[";
-                for (int k = 0; k < p.keyCount; ++k) {
-                    if (k) j += ",";
-                    j += "{\"usage\":" + std::to_string(p.keys[k].usage);
-                    j += ",\"label\":\"" + JsonEscape(p.keys[k].label) + "\"";
-                    j += ",\"action\":\"" + JsonEscape(p.keys[k].action) + "\"}";
-                }
-                j += "]}";
-            }
-            j += "]}";
-            HttpSendJson(cli, j);
-        }
-        // GET /api/v1/config/export — текущий config.ini (base64) для бэкапа/шеринга
-        else if (method == "GET" && path == "/api/v1/config/export") {
-            std::string content;
-            FILE* f = fopen(CONFIG_FILE, "rb");
-            if (f) {
-                char buf[4096];
-                size_t n;
-                while ((n = fread(buf, 1, sizeof(buf), f)) > 0) content.append(buf, n);
-                fclose(f);
-            }
-            std::string j = "{\"config\":\"" + B64Encode(content) + "\"}";
-            HttpSendJson(cli, j);
-        }
-        // POST /api/v1/config/import — {config: "<base64>"} → записать config.ini и перезагрузить
-        else if (method == "POST" && path == "/api/v1/config/import") {
-            std::string b64;
-            JsonGetStr(body, "config", b64);
-            std::string cfg = B64Decode(b64);
-            if (cfg.empty()) { HttpSendJson(cli, "{\"error\":\"missing or empty config\"}", 400); }
-            else {
-                std::wstring wpath;
-                int wlen = MultiByteToWideChar(CP_ACP, 0, CONFIG_FILE, -1, NULL, 0);
-                wpath.resize(wlen);
-                MultiByteToWideChar(CP_ACP, 0, CONFIG_FILE, -1, &wpath[0], wlen);
-                if (!wpath.empty() && wpath.back() == 0) wpath.pop_back();
-                keysidekick::StorageResult r = keysidekick::AtomicWriteUtf8(
-                    wpath, cfg, [](const std::string&, std::string*) { return true; });
-                if (!r.ok()) {
-                    HttpSendJson(cli, "{\"error\":\"write failed\"}", 500);
-                } else {
-                    DashOp* op = new DashOp();
-                    op->op = DASH_RELOAD;
-                    DashOpResult rr = RunDashOp(op);
-                    if (rr.callerOwnsOp) delete op;
-                    HttpSendJson(cli, rr.ok ? "{\"ok\":true}" : "{\"error\":\"reload failed\"}", rr.ok ? 200 : 500);
-                }
-            }
-        }
-        // POST /api/v1/preset/apply — создать targeted-profile с маппингами агента
-        else if (method == "POST" && path == "/api/v1/preset/apply") {
-            std::string agentId, profileId, name, windowClass, processName, exePath;
-            JsonGetStr(body, "agentId", agentId);
-            JsonGetStr(body, "profileId", profileId);
-            JsonGetStr(body, "name", name);
-            JsonGetStr(body, "windowClass", windowClass);
-            JsonGetStr(body, "processName", processName);
-            JsonGetStr(body, "exePath", exePath);
-            if (agentId.empty()) { HttpSendJson(cli, "{\"error\":\"missing agentId\"}", 400); }
-            else {
-                DashOp* op = new DashOp();
-                op->op = DASH_APPLY_PRESET;
-                strncpy(op->strArg2, agentId.c_str(), 127);
-                strncpy(op->profile, profileId.c_str(), 63);
-                strncpy(op->strArg1, name.c_str(), 127);
-                strncpy(op->targetClass, windowClass.c_str(), 255);
-                op->targetClass[255] = 0;
-                strncpy(op->targetExe, processName.c_str(), 255);
-                op->targetExe[255] = 0;
-                strncpy(op->targetPath, exePath.c_str(), 511);
-                op->targetPath[511] = 0;
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok ? "{\"ok\":true}"
-                    : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if (rr.callerOwnsOp) delete op;
-            }
-        }
-        // POST /api/v1/applications/test-resolve — {windowClass, processName, processPath}
-        // Проверить, находится ли окно для данного target
-        else if (method == "POST" && path == "/api/v1/applications/test-resolve") {
-            std::string windowClass, processName, processPath;
-            JsonGetStr(body, "windowClass", windowClass);
-            JsonGetStr(body, "processName", processName);
-            JsonGetStr(body, "processPath", processPath);
-
-            auto toWstring = [](const std::string& s) -> std::wstring {
-                if (s.empty()) return std::wstring();
-                int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
-                std::wstring ws(len, 0);
-                MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &ws[0], len);
-                return ws;
-            };
-
-            keysidekick::windows_targets::WindowFilterPolicy policy;
-            policy.requireVisible = true;
-            policy.excludeEmptyTitles = false;
-            policy.excludeToolWindows = false;
-            policy.excludeShellWindows = false;
-            std::vector<keysidekick::windows_targets::WindowCandidate> windows =
-                keysidekick::windows_targets::EnumerateWindows(policy);
-
-            keysidekick::windows_targets::TargetQuery query;
-            query.windowClass = toWstring(windowClass);
-            query.processName = toWstring(processName);
-            query.processPath = toWstring(processPath);
-
-            keysidekick::windows_targets::WindowCandidate resolved;
-            bool found = keysidekick::windows_targets::ResolveTarget(windows, query, &resolved, policy);
-
-            if (found) {
-                auto toUtf8 = [](const std::wstring& ws) -> std::string {
-                    if (ws.empty()) return std::string();
-                    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
-                    std::string s(len, 0);
-                    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], len, NULL, NULL);
-                    return s;
-                };
-                char header[128];
-                snprintf(header, sizeof(header), "{\"found\":true,\"hwnd\":%lu,\"pid\":%lu,\"title\":\"",
-                    (unsigned long)resolved.handle, (unsigned long)resolved.processId);
-                std::string resp = header;
-                resp += JsonEscape(toUtf8(resolved.title));
-                resp += "\"}";
-                HttpSendJson(cli, resp);
-            } else {
-                HttpSendJson(cli, "{\"found\":false}");
-            }
-        }
-        // ---- Phase 4: SSE live updates ----
-        // GET /api/v1/events — Server-Sent Events stream
-        else if (method == "GET" && path == "/api/v1/events") {
-            // M6: эхо Origin запроса (loopback) — SSE работает и для
-            // 127.0.0.1, и для localhost; "*" для клиентов без Origin.
-            std::string sseOrigin = "*";
-            if (!originHeader.empty() &&
-                keysidekick::IsAllowedOrigin(originHeader, (unsigned short)g_httpPort, false)) {
-                sseOrigin = originHeader;
-            }
-            SseClientStart* start = new SseClientStart();
-            start->socket = cli;
-            start->origin = sseOrigin;
-            HANDLE worker = CreateThread(NULL, 0, SseClientThread, start, 0, NULL);
-            if (worker) {
-                CloseHandle(worker);
-            } else {
-                delete start;
-                closesocket(cli);
-            }
-            continue;  // skip the closesocket at the end
-        }
-        // ---- Phase 6: Startup management ----
-        // GET /api/v1/startup — check if auto-start is configured
-        else if (method == "GET" && path == "/api/v1/startup") {
-            // Check Startup folder for KeySidekick.lnk
-            wchar_t startupDir[MAX_PATH] = {0};
-            if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_STARTUP, NULL, 0, startupDir))) {
-                std::wstring shortcutPath = std::wstring(startupDir) + L"\\KeySidekick.lnk";
-                DWORD attr = GetFileAttributesW(shortcutPath.c_str());
-                bool exists = (attr != INVALID_FILE_ATTRIBUTES);
-                std::string resp = "{\"installed\":";
-                resp += exists ? "true" : "false";
-                resp += "}";
-                HttpSendJson(cli, resp);
-            } else {
-                HttpSendJson(cli, "{\"installed\":false,\"error\":\"cannot query startup folder\"}", 500);
-            }
-        }
-        // POST /api/v1/startup — {enabled: true/false} to create/remove startup shortcut
-        else if (method == "POST" && path == "/api/v1/startup") {
-            std::string enabledStr;
-            JsonGetStr(body, "enabled", enabledStr);
-            bool enabled = (enabledStr == "true" || enabledStr == "1");
-
-            wchar_t startupDir[MAX_PATH] = {0};
-            if (!SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_STARTUP, NULL, 0, startupDir))) {
-                HttpSendJson(cli, "{\"error\":\"cannot find startup folder\"}", 500);
-                closesocket(cli); continue;
-            }
-            std::wstring shortcutPath = std::wstring(startupDir) + L"\\KeySidekick.lnk";
-
-            if (enabled) {
-                // Create shortcut via IShellLinkW COM (safe, no shell injection, no console flash)
-                wchar_t exePath[MAX_PATH] = {0};
-                DWORD exeLen = GetModuleFileNameW(NULL, exePath, MAX_PATH);
-                bool created = false;
-                if (exeLen > 0 && exeLen < MAX_PATH) {
-                    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-                    if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
-                        IShellLinkW* pShellLink = NULL;
-                        hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (LPVOID*)&pShellLink);
-                        if (SUCCEEDED(hr) && pShellLink) {
-                            pShellLink->SetPath(exePath);
-                            // Working directory = exe folder
-                            std::wstring exeDir = std::wstring(exePath);
-                            std::size_t lastSlash = exeDir.find_last_of(L'\\');
-                            if (lastSlash != std::wstring::npos) {
-                                exeDir = exeDir.substr(0, lastSlash);
-                                pShellLink->SetWorkingDirectory(exeDir.c_str());
-                            }
-                            pShellLink->SetShowCmd(SW_SHOWMINNOACTIVE);  // minimized
-                            IPersistFile* pPersistFile = NULL;
-                            hr = pShellLink->QueryInterface(IID_IPersistFile, (LPVOID*)&pPersistFile);
-                            if (SUCCEEDED(hr) && pPersistFile) {
-                                hr = pPersistFile->Save(shortcutPath.c_str(), TRUE);
-                                if (SUCCEEDED(hr)) created = true;
-                                pPersistFile->Release();
-                            }
-                            pShellLink->Release();
-                        }
-                        // Only uninitialize if we initialized (not RPC_E_CHANGED_MODE)
-                        if (SUCCEEDED(hr)) CoUninitialize();
-                    }
-                }
-                if (created) {
-                    Log("Startup shortcut created: %ls", shortcutPath.c_str());
-                    HttpSendJson(cli, "{\"ok\":true,\"installed\":true}");
-                } else {
-                    Log("Startup shortcut creation FAILED");
-                    HttpSendJson(cli, "{\"error\":\"shortcut creation failed\"}", 500);
-                }
-            } else {
-                if (DeleteFileW(shortcutPath.c_str())) {
-                    Log("Startup shortcut removed");
-                    HttpSendJson(cli, "{\"ok\":true,\"installed\":false}");
-                } else {
-                    // Not an error if file didn't exist
-                    DWORD err = GetLastError();
-                    if (err == ERROR_FILE_NOT_FOUND) {
-                        HttpSendJson(cli, "{\"ok\":true,\"installed\":false}");
-                    } else {
-                        Log("Startup shortcut removal failed err=%lu", err);
-                        HttpSendJson(cli, "{\"error\":\"removal failed\"}", 500);
-                    }
-                }
-            }
-        }
-        // GET /api/v1/devices — enumerate all WinUSB/HID keyboards for multi-device setup
-        else if (method == "GET" && path == "/api/v1/devices") {
-            // Enumerate all WinUSB-compatible devices (not filtering by VID/PID)
-            std::string j = "{\"devices\":[";
-            bool first = true;
-
-            const GUID* guids[] = { &GUID_DEVINTERFACE_WINUSB, &GUID_DEVINTERFACE_TARGET_WINUSB, &GUID_DEVINTERFACE_LIBUSB0, NULL };
-            for (int g = 0; guids[g]; g++) {
-                HDEVINFO hDev = SetupDiGetClassDevs(guids[g], NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-                if (hDev == INVALID_HANDLE_VALUE) continue;
-                SP_DEVICE_INTERFACE_DATA ifData = { sizeof(ifData) };
-                for (DWORD idx = 0; SetupDiEnumDeviceInterfaces(hDev, NULL, guids[g], idx, &ifData); idx++) {
-                    DWORD needed = 0;
-                    SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, NULL, 0, &needed, NULL);
-                    if (!needed) continue;
-                    std::vector<BYTE> buf(needed);
-                    PSP_DEVICE_INTERFACE_DETAIL_DATA_A det = (PSP_DEVICE_INTERFACE_DETAIL_DATA_A)buf.data();
-                    det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
-                    if (!SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, det, needed, NULL, NULL)) continue;
-
-                    const char* dp = det->DevicePath;
-                    // Extract VID/PID from path
-                    std::string vidpid;
-                    const char* vid = strstr(dp, "vid_");
-                    if (vid) {
-                        const char* mi = strstr(dp, "&mi_");
-                        std::size_t vidEnd = mi ? (std::size_t)(mi - dp - (vid - dp)) : std::string::npos;
-                        if (vidEnd != std::string::npos) {
-                            vidpid.assign(dp + (vid - dp), vidEnd - (vid - dp));
-                        }
-                    }
-                    std::string displayName = vidpid.empty() ? "WinUSB Device" : vidpid;
-                    if (!first) j += ",";
-                    first = false;
-                    j += "{\"path\":\"" + JsonEscape(dp) + "\",\"vidpid\":\"" + JsonEscape(vidpid) + "\",\"name\":\"" + JsonEscape(displayName) + "\"}";
-                }
-                SetupDiDestroyDeviceInfoList(hDev);
-            }
-            j += "]}";
-            HttpSendJson(cli, j);
-        }
-        // GET /api/v1/devices/detect — probe each WinUSB keyboard: short read with 500ms timeout,
-        // and tell the caller which device (if any) produced data. Used for "identify my keyboard".
-        else if (method == "GET" && path == "/api/v1/devices/detect") {
-            std::string j = "{\"detected\":[";
-            bool firstDet = true;
-
-            const GUID* guids[] = { &GUID_DEVINTERFACE_WINUSB, &GUID_DEVINTERFACE_TARGET_WINUSB, &GUID_DEVINTERFACE_LIBUSB0, NULL };
-            for (int g = 0; guids[g]; g++) {
-                HDEVINFO hDev = SetupDiGetClassDevs(guids[g], NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-                if (hDev == INVALID_HANDLE_VALUE) continue;
-                SP_DEVICE_INTERFACE_DATA ifData = { sizeof(ifData) };
-                for (DWORD idx = 0; SetupDiEnumDeviceInterfaces(hDev, NULL, guids[g], idx, &ifData); idx++) {
-                    DWORD needed = 0;
-                    SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, NULL, 0, &needed, NULL);
-                    if (!needed) continue;
-                    std::vector<BYTE> buf(needed);
-                    PSP_DEVICE_INTERFACE_DETAIL_DATA_A det = (PSP_DEVICE_INTERFACE_DETAIL_DATA_A)buf.data();
-                    det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
-                    if (!SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, det, needed, NULL, NULL)) continue;
-
-                    // Try opening + reading from this device for 500ms
-                    HANDLE h = CreateFileA(det->DevicePath, GENERIC_READ | GENERIC_WRITE,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-                    if (h == INVALID_HANDLE_VALUE) continue;
-                    WINUSB_INTERFACE_HANDLE wusb = NULL;
-                    if (!WinUsb_Initialize(h, &wusb)) { CloseHandle(h); continue; }
-                    // M3: не хардкодим 0x81 — читаем фактический interrupt-IN pipe
-                    // из дескриптора интерфейса (у некоторых клавиатур он другой).
-                    BYTE pipeId = QueryInterruptInPipe(wusb);
-                    if (pipeId == 0xFF) { WinUsb_Free(wusb); CloseHandle(h); continue; }
-                    // Set short timeout for detection
-                    ULONG timeoutMs = 500;
-                    WinUsb_SetPipePolicy(wusb, pipeId, PIPE_TRANSFER_TIMEOUT, sizeof(timeoutMs), &timeoutMs);
-                    BYTE rbuf[8] = {0};
-                    OVERLAPPED ov = {0}; ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-                    if (ov.hEvent) {
-                        ULONG got = 0;
-                        if (WinUsb_ReadPipe(wusb, pipeId, rbuf, sizeof(rbuf), &got, &ov)) {
-                            // Immediate data — device is actively sending
-                            if (!firstDet) j += ",";
-                            firstDet = false;
-                            char shortPath[256];
-                            strncpy(shortPath, det->DevicePath, sizeof(shortPath)-1);
-                            j += "{\"path\":\"" + JsonEscape(shortPath) + "\",\"detected\":true}";
-                        } else if (GetLastError() == ERROR_IO_PENDING) {
-                            DWORD wr = WaitForSingleObject(ov.hEvent, 500);
-                            if (wr == WAIT_OBJECT_0) {
-                                if (WinUsb_GetOverlappedResult(wusb, &ov, &got, FALSE) && got > 0) {
-                                    if (!firstDet) j += ",";
-                                    firstDet = false;
-                                    char shortPath[256];
-                                    strncpy(shortPath, det->DevicePath, sizeof(shortPath)-1);
-                                    j += "{\"path\":\"" + JsonEscape(shortPath) + "\",\"detected\":true}";
-                                }
-                            } else {
-                                WinUsb_AbortPipe(wusb, pipeId);
-                                WaitForSingleObject(ov.hEvent, 100);
-                            }
-                        }
-                        CloseHandle(ov.hEvent);
-                    }
-                    WinUsb_Free(wusb);
-                    CloseHandle(h);
-                }
-                SetupDiDestroyDeviceInfoList(hDev);
-            }
-            j += "]}";
-            HttpSendJson(cli, j);
-        }
-        // GET /api/v1/devices/capture — interactive keyboard test
-        // Opens each available device briefly and captures which one produced data.
-        // Used by onboarding wizard: "press any key on your keyboard".
-        else if (method == "POST" && path == "/api/v1/devices/capture") {
-            std::string j = "{\"found\":null,\"counts\":{}";
-            DWORD start = GetTickCount();
-            BYTE sampleBuf[8] = {0};
-            int bestGot = 0;
-            std::string bestPath;
-
-            const GUID* guids[] = { &GUID_DEVINTERFACE_WINUSB, &GUID_DEVINTERFACE_TARGET_WINUSB, &GUID_DEVINTERFACE_LIBUSB0, NULL };
-            for (int g = 0; guids[g]; g++) {
-                HDEVINFO hDev = SetupDiGetClassDevs(guids[g], NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-                if (hDev == INVALID_HANDLE_VALUE) continue;
-                SP_DEVICE_INTERFACE_DATA ifData = { sizeof(ifData) };
-                for (DWORD idx = 0; SetupDiEnumDeviceInterfaces(hDev, NULL, guids[g], idx, &ifData); idx++) {
-                    DWORD needed = 0;
-                    SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, NULL, 0, &needed, NULL);
-                    if (!needed) continue;
-                    std::vector<BYTE> buf(needed);
-                    PSP_DEVICE_INTERFACE_DETAIL_DATA_A det = (PSP_DEVICE_INTERFACE_DETAIL_DATA_A)buf.data();
-                    det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
-                    if (!SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, det, needed, NULL, NULL)) continue;
-
-                    // Try opening and reading for 300ms
-                    HANDLE h = CreateFileA(det->DevicePath, GENERIC_READ | GENERIC_WRITE,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-                    if (h == INVALID_HANDLE_VALUE) continue;
-                    WINUSB_INTERFACE_HANDLE wusb = NULL;
-                    if (!WinUsb_Initialize(h, &wusb)) { CloseHandle(h); continue; }
-                    // M3: фактический interrupt-IN pipe из дескриптора, не 0x81.
-                    BYTE pipeId = QueryInterruptInPipe(wusb);
-                    if (pipeId == 0xFF) { WinUsb_Free(wusb); CloseHandle(h); continue; }
-                    ULONG timeoutMs = 300;
-                    WinUsb_SetPipePolicy(wusb, pipeId, PIPE_TRANSFER_TIMEOUT, sizeof(timeoutMs), &timeoutMs);
-
-                    OVERLAPPED ov = {0};
-                    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-                    if (ov.hEvent) {
-                        ULONG got = 0;
-                        BOOL ok = WinUsb_ReadPipe(wusb, pipeId, sampleBuf, sizeof(sampleBuf), &got, &ov);
-                        if (ok && got > 0) {
-                            if (got > bestGot) { bestGot = (int)got; bestPath = det->DevicePath; }
-                        } else if (GetLastError() == ERROR_IO_PENDING) {
-                            DWORD wr = WaitForSingleObject(ov.hEvent, 300);
-                            if (wr == WAIT_OBJECT_0 && WinUsb_GetOverlappedResult(wusb, &ov, &got, FALSE) && got > 0) {
-                                if (got > bestGot) { bestGot = (int)got; bestPath = det->DevicePath; }
-                            }
-                            WinUsb_AbortPipe(wusb, pipeId);
-                            WaitForSingleObject(ov.hEvent, 50);
-                        }
-                        CloseHandle(ov.hEvent);
-                    }
-                    WinUsb_Free(wusb);
-                    CloseHandle(h);
-                }
-                SetupDiDestroyDeviceInfoList(hDev);
-            }
-
-            if (!bestPath.empty()) {
-                j += ",\"found\":{\"path\":\"" + JsonEscape(bestPath) + "\",\"bytes\":" + std::to_string(bestGot) + "}";
-            }
-            j += "}";
-            HttpSendJson(cli, j);
-        }
-        // ---- Phase "HID-first": все устройства ввода (обычные + WinUSB) ----
-        // GET /api/v1/hid — клавиатуры, мыши, смарт-устройства с клавиатурой
-        // независимо от драйвера: status ready (WinUSB) | needs-driver | ordinary.
-        else if (method == "GET" && path == "/api/v1/hid") {
-            std::vector<InputDeviceRow> rows;
-            EnumerateInputDevices(rows);
-            std::string j = "{\"devices\":[";
-            bool first = true;
-            for (std::size_t i = 0; i < rows.size(); ++i) {
-                const InputDeviceRow& r = rows[i];
-                std::string status = r.winusb ? "ready"
-                    : (r.kinds.find("keyboard") != std::string::npos ? "needs-driver" : "ordinary");
-                if (!first) j += ",";
-                first = false;
-                j += "{\"usbId\":\"" + JsonEscape(r.usbId) + "\"";
-                j += ",\"name\":\"" + JsonEscape(r.name) + "\"";
-                j += ",\"vid\":\"" + r.vid + "\"";
-                j += ",\"pid\":\"" + r.pid + "\"";
-                j += ",\"mi\":\"" + r.mi + "\"";
-                j += ",\"service\":\"" + JsonEscape(r.service) + "\"";
-                j += ",\"kinds\":\"" + r.kinds + "\"";
-                j += ",\"status\":\"" + status + "\"";
-                j += ",\"hidPath\":\"" + JsonEscape(r.hidPath) + "\"";
-                j += ",\"winusbPath\":\"" + JsonEscape(r.winusbPath) + "\"";
-                j += "}";
-            }
-            j += "]}";
-            HttpSendJson(cli, j);
-        }
-        // POST /api/v1/input/identify — сброс и старт окна прослушивания:
-        // пользователь жмёт клавишу, GET отдаёт источник (VID/PID).
-        else if (method == "POST" && path == "/api/v1/input/identify") {
-            EnterCriticalSection(&g_csIdentified);
-            g_identified.has = false;
-            g_identified.identifiable = false;
-            g_identified.seq = 0;
-            g_identified.lastVk = 0;
-            g_identified.lastMakeCode = 0;
-            g_identified.vid.clear(); g_identified.pid.clear(); g_identified.mi.clear();
-            g_identified.name.clear(); g_identified.path.clear();
-            g_identifyEvents.clear();
-            g_identifySeq = 0;
-            LeaveCriticalSection(&g_csIdentified);
-            HttpSendJson(cli, "{\"ok\":true,\"listening\":true}");
-        }
-        // GET /api/v1/input/identify — poll: живой фид нажатий + источник (VID/PID)
-        else if (method == "GET" && path == "/api/v1/input/identify") {
-            std::string j = "{";
-            EnterCriticalSection(&g_csIdentified);
-            j += std::string("\"listening\":") + (g_identified.has ? "true" : "false");
-            j += ",\"count\":" + std::to_string(g_identifySeq);
-            if (g_identified.has) {
-                j += ",\"identifiable\":" + std::string(g_identified.identifiable ? "true" : "false");
-                j += ",\"lastVk\":" + std::to_string(g_identified.lastVk);
-                j += ",\"lastMakeCode\":" + std::to_string(g_identified.lastMakeCode);
-                if (g_identified.identifiable) {
-                    j += ",\"device\":{";
-                    j += "\"vid\":\"" + g_identified.vid + "\"";
-                    j += ",\"pid\":\"" + g_identified.pid + "\"";
-                    j += ",\"mi\":\"" + g_identified.mi + "\"";
-                    j += ",\"name\":\"" + JsonEscape(g_identified.name) + "\"";
-                    j += ",\"path\":\"" + JsonEscape(g_identified.path) + "\"";
-                    j += "}";
-                }
-            }
-            // live-поток последних нажатий
-            j += ",\"events\":[";
-            for (std::size_t i = 0; i < g_identifyEvents.size(); ++i) {
-                const IdentifyEvent& e = g_identifyEvents[i];
-                if (i) j += ",";
-                j += "{\"seq\":" + std::to_string(e.seq);
-                j += ",\"vk\":" + std::to_string(e.vk);
-                j += ",\"makeCode\":" + std::to_string(e.makeCode);
-                j += ",\"identifiable\":" + std::string(e.identifiable ? "true" : "false");
-                j += ",\"vid\":\"" + e.vid + "\"";
-                j += ",\"pid\":\"" + e.pid + "\"";
-                j += ",\"name\":\"" + JsonEscape(e.name) + "\"";
-                j += "}";
-            }
-            j += "]";
-            LeaveCriticalSection(&g_csIdentified);
-            j += "}";
-            HttpSendJson(cli, j);
-        }
-        // GET /api/v1/activity — недавно сработавшие actions (Live-экран)
-        else if (method == "GET" && path == "/api/v1/activity") {
-            std::vector<ActivityEvent> copy;
-            EnterCriticalSection(&g_csActivity);
-            copy = g_activityEvents;
-            LeaveCriticalSection(&g_csActivity);
-            std::string j = "{\"events\":[";
-            for (std::size_t i = 0; i < copy.size(); ++i) {
-                const ActivityEvent& e = copy[i];
-                if (i) j += ",";
-                j += "{\"seq\":" + std::to_string(e.seq);
-                j += ",\"t\":" + std::to_string(e.tick);
-                j += ",\"usage\":" + std::to_string(e.usage);
-                j += ",\"action\":\"" + JsonEscape(e.action) + "\"";
-                j += ",\"mode\":\"" + JsonEscape(e.mode) + "\"";
-                j += "}";
-            }
-            j += "]}";
-            HttpSendJson(cli, j);
-        }
-        // POST /api/v1/devices/activate — {vidpid}: сделать устройство активным:
-        // добавить VID/PID в config (DeviceVIDPID) и переподключить hot path.
-        else if (method == "POST" && path == "/api/v1/devices/activate") {
-            std::string vidpid, devPath;
-            JsonGetStr(body, "vidpid", vidpid);
-            JsonGetStr(body, "path", devPath);
-            std::string norm;
-            bool fmtOk = false;
-            if (!devPath.empty()) {
-                // Per-instance: полный путь устройства как паттерн (lowercase).
-                // FindDevicePath матчит substring — путь содержит серийник, так что
-                // попадает только этот конкретный экземпляр (две одинаковые клавиатуры).
-                for (std::size_t ci = 0; ci < devPath.size(); ++ci) {
-                    char c = devPath[ci];
-                    if (c != ' ' && c != '\t') norm += (char)tolower((unsigned char)c);
-                }
-                fmtOk = !norm.empty() && norm.size() <= 255;
-            } else {
-                // Формат: "vid_xxxx&pid_yyyy" (4 hex каждая).
-                for (std::size_t ci = 0; ci < vidpid.size(); ++ci) {
-                    char c = vidpid[ci];
-                    if (c != ' ' && c != '\t') norm += (char)tolower((unsigned char)c);
-                }
-                fmtOk = (norm.size() >= 17 && norm.compare(0, 4, "vid_") == 0);
-                if (fmtOk) {
-                    std::size_t amp = norm.find("&pid_", 4);
-                    if (amp == std::string::npos || amp + 9 > norm.size()) fmtOk = false;
-                    else {
-                        for (std::size_t ci = 4; ci < amp && fmtOk; ++ci)
-                            if (!isxdigit((unsigned char)norm[ci])) fmtOk = false;
-                        for (std::size_t ci = amp + 5; ci < norm.size() && fmtOk; ++ci)
-                            if (!isxdigit((unsigned char)norm[ci])) fmtOk = false;
-                    }
-                }
-            }
-            if (!fmtOk) {
-                HttpSendJson(cli, "{\"error\":\"invalid vidpid or device path\"}", 400);
-            } else {
-                DashOp* op = new DashOp();
-                op->op = DASH_ACTIVATE_DEVICE;
-                strncpy(op->action, norm.c_str(), 255);
-                op->action[255] = 0;
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok
-                    ? "{\"ok\":true,\"pattern\":\"" + JsonEscape(norm) + "\"}"
-                    : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                if (rr.ok) {
-                    // ACTIVATE WARNING: если устройство видно в /api/v1/hid, но НЕ
-                    // WinUSB-ready (status != ready), реконнект его не откроет —
-                    // предупреждаем пользователя (остаёмся lenient: ok:true; если
-                    // устройства в списке нет — паттерн может быть частичным).
-                    std::vector<InputDeviceRow> rows;
-                    EnumerateInputDevices(rows);
-                    bool exactFound = false;
-                    bool ready = false;
-                    for (std::size_t ri = 0; ri < rows.size(); ++ri) {
-                        const InputDeviceRow& r = rows[ri];
-                        bool match = false;
-                        if (!devPath.empty()) {
-                            std::string hay = ToLower(r.hidPath.c_str()) + ToLower(r.winusbPath.c_str());
-                            match = !hay.empty() && hay.find(norm) != std::string::npos;
-                        } else {
-                            std::string rowPat = "vid_" + ToLower(r.vid.c_str()) + "&pid_" + ToLower(r.pid.c_str());
-                            match = (rowPat == norm);
-                        }
-                        if (match) { exactFound = true; if (r.winusb) ready = true; }
-                    }
-                    if (exactFound && !ready) {
-                        resp = "{\"ok\":true,\"pattern\":\"" + JsonEscape(norm)
-                            + "\",\"warning\":\"device is not on the WinUSB driver — run the driver swap first\"}";
-                    }
-                }
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if (rr.callerOwnsOp) delete op;
-            }
-        }
-        // POST /api/v1/action/fire — {action, usage?, profile?} → выполнить действие
-        // «как будто нажата физическая клавиша» на активном (или указанном) профиле.
-        // Runtime-only: config не пишется. Используется Live click-to-fire.
-        else if (method == "POST" && path == "/api/v1/action/fire") {
-            std::string action, profile;
-            int usage = 0;
-            JsonGetStr(body, "action", action);
-            JsonGetStr(body, "profile", profile);
-            JsonGetInt(body, "usage", usage);
-            if (action.empty()) {
-                HttpSendJson(cli, "{\"error\":\"missing action\"}", 400);
-            } else {
-                DashOp* op = new DashOp();
-                op->op = DASH_FIRE_ACTION;
-                op->noPersist = true;
-                strncpy(op->action, action.c_str(), 255);
-                op->action[255] = 0;
-                strncpy(op->profile, profile.c_str(), 63);
-                op->profile[63] = 0;
-                op->usage = usage;
-                DashOpResult rr = RunDashOp(op);
-                std::string resp = rr.ok
-                    ? "{\"ok\":true,\"fired\":true}"
-                    : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
-                HttpSendJson(cli, resp, rr.ok ? 200 : 400);
-                if (rr.callerOwnsOp) delete op;
-            }
-        }
-        // ---- Phase 7: Diagnostics ----
-        // GET /api/v1/diagnostics — device/driver/config health snapshot
-        else if (method == "GET" && path == "/api/v1/diagnostics") {
-            std::string j = "{";
-            // Device state
-            j += "\"device\":\"" + std::string(g_hWinUsb ? "connected" : "disconnected") + "\"";
-            j += ",\"winusbHandle\":" + std::string(g_hWinUsb ? "true" : "false");
-            char pipeHex[8]; snprintf(pipeHex, sizeof(pipeHex), "0x%02X", g_interruptInPipe);
-            j += ",\"pipeId\":\"" + std::string(pipeHex) + "\"";
-            j += ",\"vidpid\":\"" + std::string(g_deviceVidPid) + "\"";
-
-            // Device path (from SetupAPI)
-            std::string devPath;
-            if (FindDevicePath(devPath)) {
-                j += ",\"devicePath\":\"" + JsonEscape(devPath) + "\"";
-                j += ",\"deviceEnumerated\":true";
-            } else {
-                j += ",\"deviceEnumerated\":false";
-            }
-
-            // Config health
-            j += ",\"configFile\":\"" + std::string(CONFIG_FILE) + "\"";
-            DWORD attr = GetFileAttributesA(CONFIG_FILE);
-            j += ",\"configExists\":" + std::string(attr != INVALID_FILE_ATTRIBUTES ? "true" : "false");
-            size_t diagProfileCount, diagAppCount;
-            std::string diagActive;
-            EnterCriticalSection(&g_csProfile);
-            diagProfileCount = g_profiles.size();
-            diagAppCount = g_domain.applications.size();
-            diagActive = g_activeProfile;
-            LeaveCriticalSection(&g_csProfile);
-            j += ",\"profileCount\":" + std::to_string(diagProfileCount);
-            j += ",\"appCount\":" + std::to_string(diagAppCount);
-            j += ",\"activeProfile\":\"" + JsonEscape(diagActive) + "\"";
-
-            // Driver check: is MI_00 using WinUSB?
-            // Check registry for the device interface GUID
-            j += ",\"driverInfo\":{";
-            j += "\"note\":\"Check Device Manager > KeySidekick device > Driver. Should be WinUSB.sys\"";
-            j += ",\"winusbGuid\":\"{901A2603-A95E-4CA8-86BF-FB0547C06B64}\"";
-            j += "}";
-
-            // HTTP/API health
-            j += ",\"httpPort\":" + std::to_string(g_httpPort);
-            j += ",\"httpEnabled\":" + std::string(g_httpEnabled ? "true" : "false");
-            j += ",\"trayEnabled\":" + std::string(g_trayEnabled ? "true" : "false");
-
-            // Recent log lines (last 10)
-            j += ",\"recentLog\":[";
-            // Read last 10 lines from log file
-            {
-                FILE* lf = fopen(LOG_FILE, "r");
-                if (lf) {
-                    // Read all lines, keep last 10
-                    std::vector<std::string> lines;
-                    char line[512];
-                    while (fgets(line, sizeof(line), lf)) {
-                        std::string s(line);
-                        while (!s.empty() && (s.back()=='\n'||s.back()=='\r')) s.pop_back();
-                        lines.push_back(s);
-                    }
-                    fclose(lf);
-                    std::size_t start = lines.size() > 10 ? lines.size() - 10 : 0;
-                    bool firstLog = true;
-                    for (std::size_t i = start; i < lines.size(); ++i) {
-                        if (!firstLog) j += ",";
-                        firstLog = false;
-                        j += "\"" + JsonEscape(lines[i]) + "\"";
-                    }
-                }
-            }
-            j += "]";
-
-            j += "}";
-            HttpSendJson(cli, j);
-        }
-        // POST /api/capture/start
-        else if (method == "POST" && path == "/api/capture/start") {
-            g_capturedUsage = 0;
-            g_captureArmed = true;
-            HttpSendJson(cli, "{\"ok\":true,\"armed\":true}");
-        }
-        // GET /api/capture/poll
-        else if (method == "GET" && path == "/api/capture/poll") {
-            int u = g_capturedUsage.load();
-            if (u != 0) {
-                g_capturedUsage = 0;   // сбросить после чтения
-                char j[128];
-                snprintf(j, sizeof(j), "{\"ready\":true,\"usage\":%d}", u);
-                HttpSendJson(cli, j);
-            } else {
-                HttpSendJson(cli, "{\"ready\":false}");
-            }
-        }
-        // Backwards-compat: GET /profiles (плоский текстовый список)
-        else if (method == "GET" && path == "/profiles") {
-            std::string list;
-            EnterCriticalSection(&g_csProfile);
-            for (auto& kv : g_profiles) { list += kv.first; list += "\n"; }
-            LeaveCriticalSection(&g_csProfile);
-            HttpSend(cli, list.c_str(), "text/plain");
-        }
-        else {
-            HttpSend(cli, "not found", "text/plain", 404);
-        }
-        closesocket(cli);
+        CloseHandle(worker);
     }
     closesocket(srv);
     WSACleanup();
     return 0;
 }
 
+// H3: обработка одного HTTP-соединения на воркере пула. Мутации сериализуются
+// через RunDashOp (main thread) и существующие критические секции; каждый
+// воркер работает со своим сокетом и локальными данными.
+static bool IsPostOnlyPath(const std::string& p) {
+    static const char* kPostOnly[] = {
+        "/api/profile/activate", "/api/profile", "/api/key", "/api/key/delete",
+        "/api/key/update", "/api/key/move", "/api/key/duplicate", "/api/reload",
+        "/api/capture/start",
+        "/api/v1/profile/create", "/api/v1/profile/delete", "/api/v1/profile/rename",
+        "/api/v1/profile/duplicate", "/api/v1/profile/link-app", "/api/v1/profile/unlink-app",
+        "/api/v1/profile/set-default-app", "/api/v1/applications/create",
+        "/api/v1/applications/test-resolve", "/api/v1/config/import",
+        "/api/v1/preset/apply", "/api/v1/devices/activate", "/api/v1/action/fire",
+        "/api/v1/windows/foreground/pick", "/api/v1/devices/capture"
+    };
+    for (const char* s : kPostOnly) if (p == s) return true;
+    return false;
+}
+
+static void HandleHttpConnection(SOCKET cli) {
+    // H1/H2: per-connection timeouts. SO_RCVTIMEO (5s) keeps one idle or
+    // slow local client from stalling the only HTTP thread forever;
+    // SO_SNDTIMEO (10s) bounds the response send (the embedded dashboard
+    // HTML is ~600 KB — a client that connects and never reads must not
+    // block the thread indefinitely either). SSE resets SO_SNDTIMEO to
+    // ~200ms in its own thread (H2).
+    DWORD rcvTimeoutMs = 5000;
+    setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTimeoutMs, sizeof(rcvTimeoutMs));
+    DWORD sndTimeoutMs = 10000;
+    setsockopt(cli, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTimeoutMs, sizeof(sndTimeoutMs));
+
+    // Накопить запрос: читать до \r\n\r\n (конец заголовков), потом body по Content-Length.
+    // H3 design decision: пул воркеров (8). Каждое соединение обрабатывается
+    // отдельным потоком; slowloris больше не блокирует дашборд. Каждый recv bounded
+    // by SO_RCVTIMEO and the WHOLE request by a 15s deadline, so a slow
+    // drip cannot monopolize the thread. Requests larger than 64 KiB are
+    // rejected (431 for headers / 413 for body) BEFORE any parsing, and a
+    // truncated read (timed-out OR clean-close mid-body) is never processed —
+    // partial JSON with defaulted fields is a real bug class (see M5).
+    std::string req;
+    char buf[2048];
+    size_t headerEnd = std::string::npos;
+    int contentLength = 0;
+    std::string hostHeader;
+    std::string csrfHeader;
+    std::string originHeader;
+    std::string contentTypeHeader;
+    std::string secFetchSiteHeader;
+    const size_t kMaxRequestBytes = 64 * 1024;
+    bool requestTooLarge = false;
+    bool truncatedRead = false;
+    const ULONGLONG requestDeadline = GetTickCount64() + 15000;
+    while (g_httpRunning) {
+        if (GetTickCount64() > requestDeadline) { truncatedRead = true; break; }
+        int r = recv(cli, buf, sizeof(buf), 0);
+        if (r == SOCKET_ERROR) {
+            // SO_RCVTIMEO expired mid-request (or transport error) —
+            // partial input is unsafe to parse.
+            truncatedRead = true;
+            break;
+        }
+        if (r == 0) {
+            // Чистое закрытие (FIN): если заголовки получены, но body
+            // недокачан по Content-Length — это тоже обрыв (M5).
+            if (headerEnd != std::string::npos &&
+                (int)(req.size() - (headerEnd + 4)) < contentLength) {
+                truncatedRead = true;
+            }
+            break;
+        }
+        req.append(buf, r);
+        if (req.size() > kMaxRequestBytes) { requestTooLarge = true; break; }
+        if (headerEnd == std::string::npos) {
+            headerEnd = req.find("\r\n\r\n");
+            if (headerEnd != std::string::npos) {
+                // парсить заголовки (Host, Content-Length, token, Origin, Content-Type, Sec-Fetch-Site)
+                std::string headers = req.substr(0, headerEnd);
+                size_t pos = 0;
+                while (pos < headers.size()) {
+                    size_t eol = headers.find("\r\n", pos);
+                    if (eol == std::string::npos) eol = headers.size();
+                    std::string line = headers.substr(pos, eol - pos);
+                    if (_strnicmp(line.c_str(), "Host:", 5) == 0) {
+                        hostHeader = line.substr(5);
+                        while (!hostHeader.empty() && (hostHeader.front()==' '||hostHeader.front()=='\t')) hostHeader.erase(0,1);
+                    } else if (_strnicmp(line.c_str(), "Content-Length:", 15) == 0) {
+                        contentLength = atoi(line.c_str()+15);
+                    } else if (_strnicmp(line.c_str(), "X-KeySidekick-Token:", 20) == 0) {
+                        csrfHeader = line.substr(20);
+                        while (!csrfHeader.empty() && (csrfHeader.front()==' '||csrfHeader.front()=='\t')) csrfHeader.erase(0,1);
+                    } else if (_strnicmp(line.c_str(), "Origin:", 7) == 0) {
+                        originHeader = line.substr(7);
+                        while (!originHeader.empty() && (originHeader.front()==' '||originHeader.front()=='\t')) originHeader.erase(0,1);
+                    } else if (_strnicmp(line.c_str(), "Content-Type:", 13) == 0) {
+                        contentTypeHeader = line.substr(13);
+                        while (!contentTypeHeader.empty() && (contentTypeHeader.front()==' '||contentTypeHeader.front()=='\t')) contentTypeHeader.erase(0,1);
+                    } else if (_strnicmp(line.c_str(), "Sec-Fetch-Site:", 15) == 0) {
+                        secFetchSiteHeader = line.substr(15);
+                        while (!secFetchSiteHeader.empty() && (secFetchSiteHeader.front()==' '||secFetchSiteHeader.front()=='\t')) secFetchSiteHeader.erase(0,1);
+                    }
+                    pos = eol + 2;
+                }
+            }
+        }
+        if (headerEnd != std::string::npos) {
+            size_t bodyHave = req.size() - (headerEnd + 4);
+            if ((int)bodyHave >= contentLength) break;   // всё тело прочитано
+        }
+    }
+    if (req.empty() || truncatedRead) { closesocket(cli); return; }
+    if (requestTooLarge) {
+        // 431 если переполнились заголовки, 413 если тело.
+        HttpSend(cli, "request too large", "text/plain",
+                 headerEnd == std::string::npos ? 431 : 413);
+        closesocket(cli); return;
+    }
+
+    // Парсим request line
+    std::string method, path, query;
+    size_t sp1 = req.find(' ');
+    if (sp1 == std::string::npos) { HttpSend(cli, "bad request", "text/plain", 400); closesocket(cli); return; }
+    method = req.substr(0, sp1);
+    size_t sp2 = req.find(' ', sp1+1);
+    std::string url = (sp2 != std::string::npos) ? req.substr(sp1+1, sp2-sp1-1) : req.substr(sp1+1);
+    size_t qp = url.find('?');
+    if (qp != std::string::npos) { path = url.substr(0, qp); query = url.substr(qp+1); }
+    else path = url;
+
+    std::string body = (headerEnd != std::string::npos) ? req.substr(headerEnd+4) : "";
+
+    // C1: роутим КАЖДЫЙ запрос через http_security pipeline.
+    // ValidateDashboardRequest (http_security.cpp, покрыт unit-тестами)
+    // enforce: loopback Host/Origin, Sec-Fetch-Site, header/body caps,
+    // mutating-GET → 405, и для mutating методов — CSRF token (403) +
+    // Content-Type: application/json (415). Это заменяет старый ad-hoc
+    // "POST ⇒ token" gate, который GET /switch и GET /profile обходили.
+    {
+        keysidekick::RequestMetadata meta;
+        meta.method = method;
+        meta.path = path;
+        meta.host = hostHeader;
+        // Голый Host (без порта) legacy-сервер терпел; нормализуем, чтобы
+        // строгий loopback-check в pipeline его тоже принял.
+        if (meta.host.find(':') == std::string::npos)
+            meta.host += ":" + std::to_string(g_httpPort);
+        meta.origin = originHeader;
+        meta.sec_fetch_site = secFetchSiteHeader;
+        meta.content_type = contentTypeHeader;
+        meta.token_header_name = "X-KeySidekick-Token";
+        meta.token_header = csrfHeader;
+        meta.header_bytes = (headerEnd != std::string::npos) ? headerEnd + 4 : req.size();
+        meta.body_bytes = body.size();
+
+        keysidekick::SecurityPolicy policy;
+        policy.port = (unsigned short)g_httpPort;
+        policy.allow_ipv6_loopback = false;
+        policy.token_header_name = "X-KeySidekick-Token";
+        policy.token = g_csrfToken;
+        policy.max_header_bytes = keysidekick::kDefaultMaxHeaderBytes;
+        policy.max_body_bytes = keysidekick::kDefaultMaxBodyBytes;
+
+        keysidekick::SecurityDecision decision =
+            keysidekick::ValidateDashboardRequest(meta, policy);
+        if (!decision.allowed) {
+            HttpSendJson(cli,
+                std::string("{\"error\":\"") + JsonEscape(decision.message) +
+                "\",\"code\":\"" + decision.code + "\"}",
+                decision.http_status);
+            closesocket(cli); return;
+        }
+    }
+
+    // C1: legacy mutating GETs (/switch, /profile) отклоняются намертво —
+    // канонический API переключения: POST /api/profile/activate.
+    if ((method == "GET" || method == "HEAD") &&
+        (path == "/switch" || path == "/profile" || IsPostOnlyPath(path))) {
+        HttpSendJson(cli,
+            "{\"error\":\"state changes require POST\",\"code\":\"mutating_get_forbidden\"}", 405);
+        closesocket(cli); return;
+    }
+
+    // --- Routing ---
+    // favicon.ico — return empty 204 to avoid 404 noise in browser console
+    if (method == "GET" && path == "/favicon.ico") {
+        HttpSend(cli, "", "image/x-icon", 204);
+    }
+    else if (method == "GET" && path == "/") {
+        // Phase 4: inject CSRF token into dashboard HTML.
+        // kDashboardHtml содержит маркер /*{{CSRF_TOKEN}}*/ который заменяется на реальный token.
+        std::string html(kDashboardHtml, kDashboardHtmlSize);
+        const std::string marker = "/*{{CSRF_TOKEN}}*/\"\"";
+        size_t pos = html.find(marker);
+        if (pos != std::string::npos) {
+            html.replace(pos, marker.size(), "\"" + g_csrfToken + "\"");
+        }
+        // Also expose state revision for SSE bootstrap
+        const std::string revMarker = "/*{{STATE_REVISION}}*/\"0\"";
+        size_t rpos = html.find(revMarker);
+        if (rpos != std::string::npos) {
+            unsigned long long curRev;
+            EnterCriticalSection(&g_csRevision); curRev = g_stateRevision; LeaveCriticalSection(&g_csRevision);
+            char revBuf[32]; snprintf(revBuf, sizeof(revBuf), "%llu", curRev);
+            html.replace(rpos, revMarker.size(), std::string("\"") + revBuf + "\"");
+        }
+        HttpSend(cli, html.c_str(), "text/html; charset=utf-8");
+    }
+    // GET /api/status
+    else if (method == "GET" && path == "/api/status") {
+        bool dev = DevInfoConnected();
+        std::string active;
+        EnterCriticalSection(&g_csProfile); active = g_activeProfile; LeaveCriticalSection(&g_csProfile);
+        std::string j = "{\"device\":\"" + std::string(dev ? "connected" : "disconnected")
+            + "\",\"active\":\"" + JsonEscape(active) + "\",\"http\":"
+            + (g_httpEnabled ? "true" : "false") + ",\"tray\":"
+            + (g_trayEnabled ? "true" : "false") + "}";
+        HttpSendJson(cli, j);
+    }
+    // GET /api/v1/state — unified snapshot with revision (Phase 4)
+    // SSE clients fetch this after receiving event:revision to get full state
+    else if (method == "GET" && path == "/api/v1/state") {
+        bool dev = DevInfoConnected();
+        std::string active;
+        unsigned long long rev;
+        size_t profileCount, appCount;
+        EnterCriticalSection(&g_csProfile);
+        active = g_activeProfile;
+        profileCount = g_profiles.size();
+        appCount = g_domain.applications.size();
+        LeaveCriticalSection(&g_csProfile);
+        EnterCriticalSection(&g_csRevision); rev = g_stateRevision; LeaveCriticalSection(&g_csRevision);
+        std::string j = "{\"version\":\"" + std::string(APP_VERSION) + "\",\"revision\":"
+            + std::to_string(rev) + ",\"device\":\"" + std::string(dev ? "connected" : "disconnected")
+            + "\",\"active\":\"" + JsonEscape(active) + "\",\"http\":"
+            + (g_httpEnabled ? "true" : "false") + ",\"tray\":"
+            + (g_trayEnabled ? "true" : "false") + ",\"profileCount\":"
+            + std::to_string(profileCount) + ",\"appCount\":" + std::to_string(appCount) + "}";
+        HttpSendJson(cli, j);
+    }
+    // GET /api/profiles (полный JSON всех профилей)
+    else if (method == "GET" && path == "/api/profiles") {
+        std::string j = "[";
+        EnterCriticalSection(&g_csProfile);
+        bool first = true;
+        for (auto& kv : g_profiles) {
+            if (!first) j += ",";
+            j += ProfileToJson(kv.second);
+            first = false;
+        }
+        std::string active = g_activeProfile;
+        LeaveCriticalSection(&g_csProfile);
+        j += "]";
+        // обернуть с active для удобства фронта
+        std::string wrap = "{\"active\":\"" + JsonEscape(active) + "\",\"profiles\":" + j + "}";
+        HttpSendJson(cli, wrap);
+    }
+    // GET /api/profile?name=X
+    else if (method == "GET" && path == "/api/profile") {
+        std::string name;
+        if (const char* p = strstr(query.c_str(), "name=")) {
+            name = p+5; size_t a = name.find('&'); if (a != std::string::npos) name = name.substr(0,a);
+        }
+        if (name.empty()) { HttpSendJson(cli, "{\"error\":\"missing name\"}", 400); }
+        else {
+            EnterCriticalSection(&g_csProfile);
+            auto it = g_profiles.find(name);
+            std::string j = (it != g_profiles.end()) ? ProfileToJson(it->second) : "{\"error\":\"not found\"}";
+            LeaveCriticalSection(&g_csProfile);
+            HttpSendJson(cli, j, (it != g_profiles.end()) ? 200 : 404);
+        }
+    }
+    // POST /api/profile/activate  body {"name":"X"}
+    // (C1: legacy GET /switch и GET /profile удалены — они мутировали state
+    //  без token/origin и теперь возвращают 405 выше по коду.)
+    else if (method == "POST" && path == "/api/profile/activate") {
+        std::string name;
+        JsonGetStr(body, "name", name);
+        if (name.empty()) {
+            // вернуть текущий (backwards-compat)
+            EnterCriticalSection(&g_csProfile); std::string cur = g_activeProfile; LeaveCriticalSection(&g_csProfile);
+            HttpSend(cli, cur.c_str(), "text/plain");
+        } else {
+            char* dup = _strdup(name.c_str());
+            PostMessageW(g_hMsgWindow, WM_HTTP_SWITCH, (WPARAM)dup, 0);
+            HttpSendJson(cli, "{\"ok\":true,\"switching\":\"" + JsonEscape(name) + "\"}");
+        }
+    }
+    // POST /api/key  body {profile, usage, mod, action} → ADD_KEY
+    else if (method == "POST" && path == "/api/key") {
+        std::string profile, action; int usage=0, mod=0;
+        JsonGetStr(body, "profile", profile);
+        JsonGetStr(body, "action", action);
+        JsonGetInt(body, "usage", usage);
+        JsonGetInt(body, "mod", mod);
+        if (profile.empty() || usage <= 0) { HttpSendJson(cli, "{\"error\":\"missing profile/usage\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_ADD_KEY;
+            snprintf(op->profile, sizeof(op->profile), "%s", profile.c_str());
+            op->usage = usage; op->mod = (unsigned char)mod;
+            snprintf(op->action, sizeof(op->action), "%s", action.c_str());
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;            }
+    }
+    // POST /api/key/delete  body {profile, usage, mod} → REMOVE_KEY
+    else if (method == "POST" && path == "/api/key/delete") {
+        std::string profile; int usage=0, mod=0;
+        JsonGetStr(body, "profile", profile);
+        JsonGetInt(body, "usage", usage);
+        JsonGetInt(body, "mod", mod);
+        if (profile.empty() || usage <= 0) { HttpSendJson(cli, "{\"error\":\"missing profile/usage\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_REMOVE_KEY;
+            snprintf(op->profile, sizeof(op->profile), "%s", profile.c_str());
+            op->usage = usage; op->mod = (unsigned char)mod;
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;            }
+    }
+    // ---- Mapping management (in-place edit, reorder) ----
+    // POST /api/key/update — body {profile, usage, mod, newAction} → DASH_UPDATE_KEY
+    else if (method == "POST" && path == "/api/key/update") {
+        std::string profile, newAction; int usage=0, mod=0;
+        JsonGetStr(body, "profile", profile);
+        JsonGetStr(body, "newAction", newAction);
+        JsonGetInt(body, "usage", usage);
+        JsonGetInt(body, "mod", mod);
+        if (profile.empty() || usage <= 0 || newAction.empty()) { HttpSendJson(cli, "{\"error\":\"missing profile/usage/newAction\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_UPDATE_KEY;
+            snprintf(op->profile, sizeof(op->profile), "%s", profile.c_str());
+            op->usage = usage; op->mod = (unsigned char)mod;
+            snprintf(op->action, sizeof(op->action), "%s", newAction.c_str());
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;
+        }
+    }
+    // POST /api/key/move — body {profile, usage, mod, direction} → DASH_MOVE_KEY (up/down swap)
+    else if (method == "POST" && path == "/api/key/move") {
+        std::string profile, dir; int usage=0, mod=0;
+        JsonGetStr(body, "profile", profile);
+        JsonGetStr(body, "direction", dir);
+        JsonGetInt(body, "usage", usage);
+        JsonGetInt(body, "mod", mod);
+        if (profile.empty() || usage <= 0) { HttpSendJson(cli, "{\"error\":\"missing profile/usage\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_MOVE_KEY;
+            snprintf(op->profile, sizeof(op->profile), "%s", profile.c_str());
+            op->usage = usage; op->mod = (unsigned char)mod;
+            snprintf(op->strArg1, sizeof(op->strArg1), "%s", dir.c_str());  // "up" or "down"
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;
+        }
+    }
+    // POST /api/key/duplicate — body {profile, usage, newUsage} → DASH_DUPLICATE_KEY
+    else if (method == "POST" && path == "/api/key/duplicate") {
+        std::string profile; int usage=0, mod=0, newUsage=0;
+        JsonGetStr(body, "profile", profile);
+        JsonGetInt(body, "usage", usage);
+        JsonGetInt(body, "mod", mod);
+        JsonGetInt(body, "newUsage", newUsage);
+        if (profile.empty() || usage <= 0 || newUsage <= 0) { HttpSendJson(cli, "{\"error\":\"missing profile/usage/newUsage\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_DUPLICATE_KEY;
+            snprintf(op->profile, sizeof(op->profile), "%s", profile.c_str());
+            op->usage = usage;
+            op->mod = (unsigned char)mod;
+            snprintf(op->strArg1, sizeof(op->strArg1), "%d", newUsage);
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;
+        }
+    }
+    // POST /api/profile  body {name, mode, targetClass, targetExe, targetPath, autoStart, layerMod} → SET_PROFILE
+    else if (method == "POST" && path == "/api/profile") {
+        std::string name, tCls, tExe, tPath, modeStr, layerMod; int autoStart=0;
+        JsonGetStr(body, "name", name);
+        JsonGetStr(body, "mode", modeStr);
+        JsonGetStr(body, "targetClass", tCls);
+        JsonGetStr(body, "targetExe", tExe);
+        JsonGetStr(body, "targetPath", tPath);
+        JsonGetStr(body, "layerMod", layerMod);
+        JsonGetInt(body, "autoStart", autoStart);
+        if (name.empty()) { HttpSendJson(cli, "{\"error\":\"missing name\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_SET_PROFILE;
+            snprintf(op->profile, sizeof(op->profile), "%s", name.c_str());
+            op->mode = (modeStr == "basic") ? 0 : 1;
+            snprintf(op->targetClass, sizeof(op->targetClass), "%s", tCls.c_str());
+            snprintf(op->targetExe, sizeof(op->targetExe), "%s", tExe.c_str());
+            snprintf(op->targetPath, sizeof(op->targetPath), "%s", tPath.c_str());
+            snprintf(op->layerMod, sizeof(op->layerMod), "%s", layerMod.c_str());
+            op->autoStart = autoStart ? 1 : 0;
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;            }
+    }
+    // POST /api/reload → ReloadConfig
+    else if (method == "POST" && path == "/api/reload") {
+        DashOp* op = new DashOp();
+        op->op = DASH_RELOAD;
+        DashOpResult rr = RunDashOp(op);
+        if (rr.callerOwnsOp) delete op;
+        HttpSendJson(cli, rr.ok ? "{\"ok\":true}" : "{\"error\":\"reload failed\"}", rr.ok ? 200 : 500);
+    }
+    // ---- Phase 2: multi-app CRUD endpoints (additive, no changes to existing) ----
+    // GET /api/v1/applications — список ApplicationTargets
+    else if (method == "GET" && path == "/api/v1/applications") {
+        std::string j = "{\"applications\":[";
+        EnterCriticalSection(&g_csProfile);
+        bool first = true;
+        for (std::size_t i = 0; i < g_domain.applications.size(); ++i) {
+            const keysidekick::ApplicationTarget& app = g_domain.applications[i];
+            if (!first) j += ",";
+            first = false;
+            j += "{\"id\":\"" + JsonEscape(app.id()) + "\"";
+            j += ",\"name\":\"" + JsonEscape(app.name) + "\"";
+            j += ",\"windowClass\":\"" + JsonEscape(app.windowClass) + "\"";
+            j += ",\"exePath\":\"" + JsonEscape(app.exePath) + "\"";
+            j += ",\"processName\":\"" + JsonEscape(app.processName) + "\"";
+            j += "}";
+        }
+        LeaveCriticalSection(&g_csProfile);
+        j += "]}";
+        HttpSendJson(cli, j);
+    }
+    // POST /api/v1/profile/create — {id, name, mode}
+    else if (method == "POST" && path == "/api/v1/profile/create") {
+        std::string id, name, modeStr;
+        JsonGetStr(body, "id", id);
+        JsonGetStr(body, "name", name);
+        JsonGetStr(body, "mode", modeStr);
+        if (id.empty()) { HttpSendJson(cli, "{\"error\":\"missing id\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_CREATE_PROFILE;
+            snprintf(op->profile, sizeof(op->profile), "%s", id.c_str());
+            snprintf(op->strArg1, sizeof(op->strArg1), "%s", name.c_str());
+            op->mode = (modeStr == "targeted") ? 1 : 0;
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;            }
+    }
+    // POST /api/v1/profile/delete — {id}
+    else if (method == "POST" && path == "/api/v1/profile/delete") {
+        std::string id;
+        JsonGetStr(body, "id", id);
+        if (id.empty()) { HttpSendJson(cli, "{\"error\":\"missing id\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_DELETE_PROFILE;
+            snprintf(op->profile, sizeof(op->profile), "%s", id.c_str());
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;            }
+    }
+    // POST /api/v1/profile/rename — {id, newName}
+    else if (method == "POST" && path == "/api/v1/profile/rename") {
+        std::string id, newName;
+        JsonGetStr(body, "id", id);
+        JsonGetStr(body, "newName", newName);
+        if (id.empty() || newName.empty()) { HttpSendJson(cli, "{\"error\":\"missing id/newName\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_RENAME_PROFILE;
+            snprintf(op->profile, sizeof(op->profile), "%s", id.c_str());
+            snprintf(op->strArg1, sizeof(op->strArg1), "%s", newName.c_str());
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;            }
+    }
+    // POST /api/v1/profile/duplicate — {sourceId, newId, newName}
+    else if (method == "POST" && path == "/api/v1/profile/duplicate") {
+        std::string sourceId, newId, newName;
+        JsonGetStr(body, "sourceId", sourceId);
+        JsonGetStr(body, "newId", newId);
+        JsonGetStr(body, "newName", newName);
+        if (sourceId.empty() || newId.empty()) { HttpSendJson(cli, "{\"error\":\"missing sourceId/newId\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_DUPLICATE_PROFILE;
+            snprintf(op->profile, sizeof(op->profile), "%s", sourceId.c_str());
+            snprintf(op->strArg1, sizeof(op->strArg1), "%s", newId.c_str());
+            snprintf(op->strArg2, sizeof(op->strArg2), "%s", newName.c_str());
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;            }
+    }
+    // POST /api/v1/profile/link-app — {profileId, appId}
+    else if (method == "POST" && path == "/api/v1/profile/link-app") {
+        std::string profileId, appId;
+        JsonGetStr(body, "profileId", profileId);
+        JsonGetStr(body, "appId", appId);
+        if (profileId.empty() || appId.empty()) { HttpSendJson(cli, "{\"error\":\"missing profileId/appId\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_LINK_APP;
+            snprintf(op->profile, sizeof(op->profile), "%s", profileId.c_str());
+            snprintf(op->strArg1, sizeof(op->strArg1), "%s", appId.c_str());
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;            }
+    }
+    // POST /api/v1/profile/unlink-app — {profileId, appId}
+    else if (method == "POST" && path == "/api/v1/profile/unlink-app") {
+        std::string profileId, appId;
+        JsonGetStr(body, "profileId", profileId);
+        JsonGetStr(body, "appId", appId);
+        if (profileId.empty() || appId.empty()) { HttpSendJson(cli, "{\"error\":\"missing profileId/appId\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_UNLINK_APP;
+            snprintf(op->profile, sizeof(op->profile), "%s", profileId.c_str());
+            snprintf(op->strArg1, sizeof(op->strArg1), "%s", appId.c_str());
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;            }
+    }
+    // POST /api/v1/profile/set-default-app — {profileId, appId}
+    else if (method == "POST" && path == "/api/v1/profile/set-default-app") {
+        std::string profileId, appId;
+        JsonGetStr(body, "profileId", profileId);
+        JsonGetStr(body, "appId", appId);
+        if (profileId.empty()) { HttpSendJson(cli, "{\"error\":\"missing profileId\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_SET_DEFAULT_APP;
+            snprintf(op->profile, sizeof(op->profile), "%s", profileId.c_str());
+            snprintf(op->strArg1, sizeof(op->strArg1), "%s", appId.c_str());
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}" : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if(rr.callerOwnsOp) delete op;            }
+    }
+    // ---- Phase 3: window discovery + application resolver ----
+    // GET /api/v1/windows — список запущенных top-level окон для visual picker
+    else if (method == "GET" && path == "/api/v1/windows") {
+        keysidekick::windows_targets::WindowFilterPolicy policy;
+        policy.requireVisible = true;
+        policy.excludeEmptyTitles = true;
+        policy.excludeToolWindows = true;
+        policy.excludeShellWindows = true;
+        std::vector<keysidekick::windows_targets::WindowCandidate> windows =
+            keysidekick::windows_targets::EnumerateWindows(policy);
+
+        std::string j = "{\"windows\":[";
+        bool first = true;
+        for (std::size_t i = 0; i < windows.size(); ++i) {
+            const auto& w = windows[i];
+            // Convert wstrings to UTF-8 for JSON
+            auto toUtf8 = [](const std::wstring& ws) -> std::string {
+                if (ws.empty()) return std::string();
+                int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
+                std::string s(len, 0);
+                WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], len, NULL, NULL);
+                return s;
+            };
+            if (!first) j += ",";
+            first = false;
+            char header[128];
+            snprintf(header, sizeof(header), "{\"hwnd\":%lu,\"pid\":%lu,\"title\":\"",
+                (unsigned long)w.handle, (unsigned long)w.processId);
+            j += header;
+            j += JsonEscape(toUtf8(w.title));
+            j += "\",\"windowClass\":\"";
+            j += JsonEscape(toUtf8(w.windowClass));
+            j += "\",\"processName\":\"";
+            j += JsonEscape(toUtf8(w.processName));
+            j += "\",\"processPath\":\"";
+            j += JsonEscape(toUtf8(w.processPath));
+            j += "\"}";
+        }
+        j += "]}";
+        HttpSendJson(cli, j);
+    }
+    // GET /api/v1/windows/foreground — current foreground window info (TinyWall-style pick)
+    else if (method == "GET" && path == "/api/v1/windows/foreground") {
+        HWND fg = GetForegroundWindow();
+        if (!fg) {
+            HttpSendJson(cli, "{\"found\":false,\"reason\":\"no foreground window\"}");
+            closesocket(cli);
+            return;
+        }
+        wchar_t title[512] = {0};
+        wchar_t cls[256] = {0};
+        GetWindowTextW(fg, title, 512);
+        GetClassNameW(fg, cls, 256);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(fg, &pid);
+        // Get process name + full image path
+        std::wstring procName;
+        std::wstring procPathFull;
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProc) {
+            wchar_t procPath[MAX_PATH] = {0};
+            DWORD sz = MAX_PATH;
+            if (QueryFullProcessImageNameW(hProc, 0, procPath, &sz)) {
+                procPathFull = procPath;
+                procName = procPath;
+                // Extract just the filename
+                std::size_t slash = procName.find_last_of(L'\\');
+                if (slash != std::wstring::npos) procName = procName.substr(slash + 1);
+            }
+            CloseHandle(hProc);
+        }
+        // Convert to UTF-8
+        auto toUtf8 = [](const std::wstring& ws) -> std::string {
+            if (ws.empty()) return std::string();
+            int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
+            std::string s(len, 0);
+            WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], len, NULL, NULL);
+            return s;
+        };
+        std::string j = "{\"found\":true,\"hwnd\":"
+            + std::to_string((unsigned long)(ULONG_PTR)fg) + ",\"pid\":"
+            + std::to_string((unsigned long)pid) + ",\"title\":\""
+            + JsonEscape(toUtf8(title)) + "\",\"windowClass\":\""
+            + JsonEscape(toUtf8(cls)) + "\",\"processName\":\""
+            + JsonEscape(toUtf8(procName)) + "\",\"processPath\":\""
+            + JsonEscape(toUtf8(procPathFull)) + "\"}";
+        HttpSendJson(cli, j);
+    }
+    // POST /api/v1/windows/foreground/pick — pick the foreground window as target for a profile
+    // (Equivalent to writing the foreground info into the profile editor)
+    else if (method == "POST" && path == "/api/v1/windows/foreground/pick") {
+        HWND fg = GetForegroundWindow();
+        if (!fg) {
+            HttpSendJson(cli, "{\"found\":false}", 400);
+            closesocket(cli);
+            return;
+        }
+        wchar_t title[512] = {0};
+        wchar_t cls[256] = {0};
+        GetWindowTextW(fg, title, 512);
+        GetClassNameW(fg, cls, 256);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(fg, &pid);
+        std::wstring procName;
+        std::wstring exePath;
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProc) {
+            wchar_t pp[MAX_PATH] = {0};
+            DWORD sz = MAX_PATH;
+            if (QueryFullProcessImageNameW(hProc, 0, pp, &sz)) {
+                exePath = pp;
+                std::size_t sl = exePath.find_last_of(L'\\');
+                if (sl != std::wstring::npos) procName = exePath.substr(sl + 1);
+            }
+            CloseHandle(hProc);
+        }
+        // Return the fields the UI needs to fill the editor
+        auto toUtf8 = [](const std::wstring& ws) -> std::string {
+            if (ws.empty()) return std::string();
+            int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
+            std::string s(len, 0);
+            WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], len, NULL, NULL);
+            return s;
+        };
+        std::string rTitle, rClass, rProc, rPath;
+        rTitle = toUtf8(title);
+        rClass = toUtf8(cls);
+        rProc = toUtf8(procName);
+        rPath = toUtf8(exePath);
+        std::string j = "{\"found\":true,\"title\":\"" + JsonEscape(rTitle)
+            + "\",\"windowClass\":\"" + JsonEscape(rClass)
+            + "\",\"processName\":\"" + JsonEscape(rProc)
+            + "\",\"processPath\":\"" + JsonEscape(rPath) + "\"}";
+        HttpSendJson(cli, j);
+    }
+    // POST /api/v1/applications/create — {name, windowClass, exePath, processName}
+    else if (method == "POST" && path == "/api/v1/applications/create") {
+        std::string name, windowClass, exePath, processName;
+        JsonGetStr(body, "name", name);
+        JsonGetStr(body, "windowClass", windowClass);
+        JsonGetStr(body, "exePath", exePath);
+        JsonGetStr(body, "processName", processName);
+        if (name.empty()) { HttpSendJson(cli, "{\"error\":\"missing name\"}", 400); }
+        else {
+            EnterCriticalSection(&g_csProfile);
+            // Generate safe application id from name
+            std::string appId = std::string("app-") + name;
+            for (char& c : appId) {
+                if (!(std::isalnum((unsigned char)c) || c == '-' || c == '_')) c = '_';
+            }
+            // Ensure uniqueness
+            std::string baseId = appId;
+            int suffix = 2;
+            while (g_domain.findApplication(appId)) {
+                char buf[16]; snprintf(buf, sizeof(buf), "%d", suffix++);
+                appId = baseId + "-" + buf;
+            }
+            g_domain.applications.push_back(keysidekick::ApplicationTarget(appId, name));
+            keysidekick::ApplicationTarget& app = g_domain.applications.back();
+            app.windowClass = windowClass;
+            app.exePath = exePath;
+            app.processName = processName;
+            LeaveCriticalSection(&g_csProfile);
+
+            WriteConfig();
+            BumpRevision();
+
+            std::string resp = "{\"ok\":true,\"id\":\"" + JsonEscape(appId) + "\"}";
+            HttpSendJson(cli, resp);
+        }
+    }
+    // GET /api/v1/presets — каталог AI-agent панелей
+    else if (method == "GET" && path == "/api/v1/presets") {
+        int n = (int)(sizeof(kAgentPresets)/sizeof(kAgentPresets[0]));
+        std::string j = "{\"presets\":[";
+        for (int i = 0; i < n; ++i) {
+            const AgentPreset& p = kAgentPresets[i];
+            if (i) j += ",";
+            j += "{\"agentId\":\"" + std::string(p.agentId) + "\"";
+            j += ",\"name\":\"" + JsonEscape(p.name) + "\"";
+            j += ",\"description\":\"" + JsonEscape(p.desc) + "\"";
+            j += ",\"kind\":\"" + std::string(p.kind) + "\"";
+            j += ",\"mode\":\"" + std::string(p.profileMode) + "\"";
+            j += ",\"keys\":[";
+            for (int k = 0; k < p.keyCount; ++k) {
+                if (k) j += ",";
+                j += "{\"usage\":" + std::to_string(p.keys[k].usage);
+                j += ",\"label\":\"" + JsonEscape(p.keys[k].label) + "\"";
+                j += ",\"action\":\"" + JsonEscape(p.keys[k].action) + "\"}";
+            }
+            j += "]}";
+        }
+        j += "]}";
+        HttpSendJson(cli, j);
+    }
+    // GET /api/v1/config/export — текущий config.ini (base64) для бэкапа/шеринга
+    else if (method == "GET" && path == "/api/v1/config/export") {
+        std::string content;
+        FILE* f = fopen(CONFIG_FILE, "rb");
+        if (f) {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) content.append(buf, n);
+            fclose(f);
+        }
+        std::string j = "{\"config\":\"" + B64Encode(content) + "\"}";
+        HttpSendJson(cli, j);
+    }
+    // POST /api/v1/config/import — {config: "<base64>"} → записать config.ini и перезагрузить
+    else if (method == "POST" && path == "/api/v1/config/import") {
+        std::string b64;
+        JsonGetStr(body, "config", b64);
+        std::string cfg = B64Decode(b64);
+        if (cfg.empty()) { HttpSendJson(cli, "{\"error\":\"missing or empty config\"}", 400); }
+        else {
+            std::wstring wpath;
+            int wlen = MultiByteToWideChar(CP_ACP, 0, CONFIG_FILE, -1, NULL, 0);
+            wpath.resize(wlen);
+            MultiByteToWideChar(CP_ACP, 0, CONFIG_FILE, -1, &wpath[0], wlen);
+            if (!wpath.empty() && wpath.back() == 0) wpath.pop_back();
+            keysidekick::StorageResult r = keysidekick::AtomicWriteUtf8(
+                wpath, cfg, [](const std::string&, std::string*) { return true; });
+            if (!r.ok()) {
+                HttpSendJson(cli, "{\"error\":\"write failed\"}", 500);
+            } else {
+                DashOp* op = new DashOp();
+                op->op = DASH_RELOAD;
+                DashOpResult rr = RunDashOp(op);
+                if (rr.callerOwnsOp) delete op;
+                HttpSendJson(cli, rr.ok ? "{\"ok\":true}" : "{\"error\":\"reload failed\"}", rr.ok ? 200 : 500);
+            }
+        }
+    }
+    // POST /api/v1/preset/apply — создать targeted-profile с маппингами агента
+    else if (method == "POST" && path == "/api/v1/preset/apply") {
+        std::string agentId, profileId, name, windowClass, processName, exePath;
+        JsonGetStr(body, "agentId", agentId);
+        JsonGetStr(body, "profileId", profileId);
+        JsonGetStr(body, "name", name);
+        JsonGetStr(body, "windowClass", windowClass);
+        JsonGetStr(body, "processName", processName);
+        JsonGetStr(body, "exePath", exePath);
+        if (agentId.empty()) { HttpSendJson(cli, "{\"error\":\"missing agentId\"}", 400); }
+        else {
+            DashOp* op = new DashOp();
+            op->op = DASH_APPLY_PRESET;
+            snprintf(op->strArg2, sizeof(op->strArg2), "%s", agentId.c_str());
+            snprintf(op->profile, sizeof(op->profile), "%s", profileId.c_str());
+            snprintf(op->strArg1, sizeof(op->strArg1), "%s", name.c_str());
+            snprintf(op->targetClass, sizeof(op->targetClass), "%s", windowClass.c_str());
+            snprintf(op->targetExe, sizeof(op->targetExe), "%s", processName.c_str());
+            snprintf(op->targetPath, sizeof(op->targetPath), "%s", exePath.c_str());
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok ? "{\"ok\":true}"
+                : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if (rr.callerOwnsOp) delete op;
+        }
+    }
+    // POST /api/v1/applications/test-resolve — {windowClass, processName, processPath}
+    // Проверить, находится ли окно для данного target
+    else if (method == "POST" && path == "/api/v1/applications/test-resolve") {
+        std::string windowClass, processName, processPath;
+        JsonGetStr(body, "windowClass", windowClass);
+        JsonGetStr(body, "processName", processName);
+        JsonGetStr(body, "processPath", processPath);
+
+        auto toWstring = [](const std::string& s) -> std::wstring {
+            if (s.empty()) return std::wstring();
+            int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
+            std::wstring ws(len, 0);
+            MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &ws[0], len);
+            return ws;
+        };
+
+        keysidekick::windows_targets::WindowFilterPolicy policy;
+        policy.requireVisible = true;
+        policy.excludeEmptyTitles = false;
+        policy.excludeToolWindows = false;
+        policy.excludeShellWindows = false;
+        std::vector<keysidekick::windows_targets::WindowCandidate> windows =
+            keysidekick::windows_targets::EnumerateWindows(policy);
+
+        keysidekick::windows_targets::TargetQuery query;
+        query.windowClass = toWstring(windowClass);
+        query.processName = toWstring(processName);
+        query.processPath = toWstring(processPath);
+
+        keysidekick::windows_targets::WindowCandidate resolved;
+        bool found = keysidekick::windows_targets::ResolveTarget(windows, query, &resolved, policy);
+
+        if (found) {
+            auto toUtf8 = [](const std::wstring& ws) -> std::string {
+                if (ws.empty()) return std::string();
+                int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
+                std::string s(len, 0);
+                WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &s[0], len, NULL, NULL);
+                return s;
+            };
+            char header[128];
+            snprintf(header, sizeof(header), "{\"found\":true,\"hwnd\":%lu,\"pid\":%lu,\"title\":\"",
+                (unsigned long)resolved.handle, (unsigned long)resolved.processId);
+            std::string resp = header;
+            resp += JsonEscape(toUtf8(resolved.title));
+            resp += "\"}";
+            HttpSendJson(cli, resp);
+        } else {
+            HttpSendJson(cli, "{\"found\":false}");
+        }
+    }
+    // ---- Phase 4: SSE live updates ----
+    // GET /api/v1/events — Server-Sent Events stream
+    else if (method == "GET" && path == "/api/v1/events") {
+        // M6: Origin эхо-заголовок выводим только когда Origin разрешён
+        // (keysidekick::IsAllowedOrigin); иначе sseOrigin пуст и заголовок
+        // Access-Control-Allow-Origin не выводится вовсе (никогда не "*").
+        std::string sseOrigin;
+        if (!originHeader.empty() &&
+            keysidekick::IsAllowedOrigin(originHeader, (unsigned short)g_httpPort, false)) {
+            sseOrigin = originHeader;
+        }
+        SseClientStart* start = new SseClientStart();
+        start->socket = cli;
+        start->origin = sseOrigin;
+        HANDLE worker = CreateThread(NULL, 0, SseClientThread, start, 0, NULL);
+        if (worker) {
+            CloseHandle(worker);
+        } else {
+            delete start;
+            closesocket(cli);
+        }
+        return;  // skip the closesocket at the end
+    }
+    // ---- Phase 6: Startup management ----
+    // GET /api/v1/startup — check if auto-start is configured
+    else if (method == "GET" && path == "/api/v1/startup") {
+        // Check Startup folder for KeySidekick.lnk
+        wchar_t startupDir[MAX_PATH] = {0};
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_STARTUP, NULL, 0, startupDir))) {
+            std::wstring shortcutPath = std::wstring(startupDir) + L"\\KeySidekick.lnk";
+            DWORD attr = GetFileAttributesW(shortcutPath.c_str());
+            bool exists = (attr != INVALID_FILE_ATTRIBUTES);
+            std::string resp = "{\"installed\":";
+            resp += exists ? "true" : "false";
+            resp += "}";
+            HttpSendJson(cli, resp);
+        } else {
+            HttpSendJson(cli, "{\"installed\":false,\"error\":\"cannot query startup folder\"}", 500);
+        }
+    }
+    // POST /api/v1/startup — {enabled: true/false} to create/remove startup shortcut
+    else if (method == "POST" && path == "/api/v1/startup") {
+        bool enabled = false;
+        JsonGetBool(body, "enabled", enabled);
+
+        wchar_t startupDir[MAX_PATH] = {0};
+        if (!SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_STARTUP, NULL, 0, startupDir))) {
+            HttpSendJson(cli, "{\"error\":\"cannot find startup folder\"}", 500);
+            closesocket(cli); return;
+        }
+        std::wstring shortcutPath = std::wstring(startupDir) + L"\\KeySidekick.lnk";
+
+        if (enabled) {
+            // Create shortcut via IShellLinkW COM (safe, no shell injection, no console flash)
+            wchar_t exePath[MAX_PATH] = {0};
+            DWORD exeLen = GetModuleFileNameW(NULL, exePath, MAX_PATH);
+            bool created = false;
+            if (exeLen > 0 && exeLen < MAX_PATH) {
+                HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+                if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
+                    IShellLinkW* pShellLink = NULL;
+                    hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (LPVOID*)&pShellLink);
+                    if (SUCCEEDED(hr) && pShellLink) {
+                        pShellLink->SetPath(exePath);
+                        // Working directory = exe folder
+                        std::wstring exeDir = std::wstring(exePath);
+                        std::size_t lastSlash = exeDir.find_last_of(L'\\');
+                        if (lastSlash != std::wstring::npos) {
+                            exeDir = exeDir.substr(0, lastSlash);
+                            pShellLink->SetWorkingDirectory(exeDir.c_str());
+                        }
+                        pShellLink->SetShowCmd(SW_SHOWMINNOACTIVE);  // minimized
+                        IPersistFile* pPersistFile = NULL;
+                        hr = pShellLink->QueryInterface(IID_IPersistFile, (LPVOID*)&pPersistFile);
+                        if (SUCCEEDED(hr) && pPersistFile) {
+                            hr = pPersistFile->Save(shortcutPath.c_str(), TRUE);
+                            if (SUCCEEDED(hr)) created = true;
+                            pPersistFile->Release();
+                        }
+                        pShellLink->Release();
+                    }
+                    // Only uninitialize if we initialized (not RPC_E_CHANGED_MODE)
+                    if (SUCCEEDED(hr)) CoUninitialize();
+                }
+            }
+            if (created) {
+                Log("Startup shortcut created: %ls", shortcutPath.c_str());
+                HttpSendJson(cli, "{\"ok\":true,\"installed\":true}");
+            } else {
+                Log("Startup shortcut creation FAILED");
+                HttpSendJson(cli, "{\"error\":\"shortcut creation failed\"}", 500);
+            }
+        } else {
+            if (DeleteFileW(shortcutPath.c_str())) {
+                Log("Startup shortcut removed");
+                HttpSendJson(cli, "{\"ok\":true,\"installed\":false}");
+            } else {
+                // Not an error if file didn't exist
+                DWORD err = GetLastError();
+                if (err == ERROR_FILE_NOT_FOUND) {
+                    HttpSendJson(cli, "{\"ok\":true,\"installed\":false}");
+                } else {
+                    Log("Startup shortcut removal failed err=%lu", err);
+                    HttpSendJson(cli, "{\"error\":\"removal failed\"}", 500);
+                }
+            }
+        }
+    }
+    // GET /api/v1/devices — enumerate all WinUSB/HID keyboards for multi-device setup
+    else if (method == "GET" && path == "/api/v1/devices") {
+        // Enumerate all WinUSB-compatible devices (not filtering by VID/PID)
+        std::string j = "{\"devices\":[";
+        bool first = true;
+
+        const GUID* guids[] = { &GUID_DEVINTERFACE_WINUSB, &GUID_DEVINTERFACE_TARGET_WINUSB, &GUID_DEVINTERFACE_LIBUSB0, NULL };
+        for (int g = 0; guids[g]; g++) {
+            HDEVINFO hDev = SetupDiGetClassDevs(guids[g], NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+            if (hDev == INVALID_HANDLE_VALUE) continue;
+            SP_DEVICE_INTERFACE_DATA ifData = { sizeof(ifData) };
+            for (DWORD idx = 0; SetupDiEnumDeviceInterfaces(hDev, NULL, guids[g], idx, &ifData); idx++) {
+                DWORD needed = 0;
+                SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, NULL, 0, &needed, NULL);
+                if (!needed) continue;
+                std::vector<BYTE> buf(needed);
+                PSP_DEVICE_INTERFACE_DETAIL_DATA_A det = (PSP_DEVICE_INTERFACE_DETAIL_DATA_A)buf.data();
+                det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+                if (!SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, det, needed, NULL, NULL)) continue;
+
+                const char* dp = det->DevicePath;
+                // Extract VID/PID from path
+                std::string vidpid;
+                const char* vid = strstr(dp, "vid_");
+                if (vid) {
+                    const char* mi = strstr(dp, "&mi_");
+                    std::size_t vidEnd = mi ? (std::size_t)(mi - dp - (vid - dp)) : std::string::npos;
+                    if (vidEnd != std::string::npos) {
+                        vidpid.assign(dp + (vid - dp), vidEnd - (vid - dp));
+                    }
+                }
+                std::string displayName = vidpid.empty() ? "WinUSB Device" : vidpid;
+                if (!first) j += ",";
+                first = false;
+                j += "{\"path\":\"" + JsonEscape(dp) + "\",\"vidpid\":\"" + JsonEscape(vidpid) + "\",\"name\":\"" + JsonEscape(displayName) + "\"}";
+            }
+            SetupDiDestroyDeviceInfoList(hDev);
+        }
+        j += "]}";
+        HttpSendJson(cli, j);
+    }
+    // GET /api/v1/devices/detect — probe each WinUSB keyboard: short read with 500ms timeout,
+    // and tell the caller which device (if any) produced data. Used for "identify my keyboard".
+    else if (method == "GET" && path == "/api/v1/devices/detect") {
+        std::string j = "{\"detected\":[";
+        bool firstDet = true;
+
+        const GUID* guids[] = { &GUID_DEVINTERFACE_WINUSB, &GUID_DEVINTERFACE_TARGET_WINUSB, &GUID_DEVINTERFACE_LIBUSB0, NULL };
+        for (int g = 0; guids[g]; g++) {
+            HDEVINFO hDev = SetupDiGetClassDevs(guids[g], NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+            if (hDev == INVALID_HANDLE_VALUE) continue;
+            SP_DEVICE_INTERFACE_DATA ifData = { sizeof(ifData) };
+            for (DWORD idx = 0; SetupDiEnumDeviceInterfaces(hDev, NULL, guids[g], idx, &ifData); idx++) {
+                DWORD needed = 0;
+                SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, NULL, 0, &needed, NULL);
+                if (!needed) continue;
+                std::vector<BYTE> buf(needed);
+                PSP_DEVICE_INTERFACE_DETAIL_DATA_A det = (PSP_DEVICE_INTERFACE_DETAIL_DATA_A)buf.data();
+                det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+                if (!SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, det, needed, NULL, NULL)) continue;
+
+                // Try opening + reading from this device for 500ms
+                HANDLE h = CreateFileA(det->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+                if (h == INVALID_HANDLE_VALUE) continue;
+                WINUSB_INTERFACE_HANDLE wusb = NULL;
+                if (!WinUsb_Initialize(h, &wusb)) { CloseHandle(h); continue; }
+                // M3: не хардкодим 0x81 — читаем фактический interrupt-IN pipe
+                // из дескриптора интерфейса (у некоторых клавиатур он другой).
+                BYTE pipeId = QueryInterruptInPipe(wusb);
+                if (pipeId == 0xFF) { WinUsb_Free(wusb); CloseHandle(h); continue; }
+                // Set short timeout for detection
+                ULONG timeoutMs = 500;
+                WinUsb_SetPipePolicy(wusb, pipeId, PIPE_TRANSFER_TIMEOUT, sizeof(timeoutMs), &timeoutMs);
+                BYTE rbuf[8] = {0};
+                OVERLAPPED ov = {0}; ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+                if (ov.hEvent) {
+                    ULONG got = 0;
+                    if (WinUsb_ReadPipe(wusb, pipeId, rbuf, sizeof(rbuf), &got, &ov)) {
+                        // Immediate data — device is actively sending
+                        if (!firstDet) j += ",";
+                        firstDet = false;
+                        char shortPath[256];
+                        strncpy(shortPath, det->DevicePath, sizeof(shortPath)-1);
+                        j += "{\"path\":\"" + JsonEscape(shortPath) + "\",\"detected\":true}";
+                    } else if (GetLastError() == ERROR_IO_PENDING) {
+                        DWORD wr = WaitForSingleObject(ov.hEvent, 500);
+                        if (wr == WAIT_OBJECT_0) {
+                            if (WinUsb_GetOverlappedResult(wusb, &ov, &got, FALSE) && got > 0) {
+                                if (!firstDet) j += ",";
+                                firstDet = false;
+                                char shortPath[256];
+                                strncpy(shortPath, det->DevicePath, sizeof(shortPath)-1);
+                                j += "{\"path\":\"" + JsonEscape(shortPath) + "\",\"detected\":true}";
+                            }
+                        } else {
+                            WinUsb_AbortPipe(wusb, pipeId);
+                            WaitForSingleObject(ov.hEvent, 100);
+                        }
+                    }
+                    CloseHandle(ov.hEvent);
+                }
+                WinUsb_Free(wusb);
+                CloseHandle(h);
+            }
+            SetupDiDestroyDeviceInfoList(hDev);
+        }
+        j += "]}";
+        HttpSendJson(cli, j);
+    }
+    // GET /api/v1/devices/capture — interactive keyboard test
+    // Opens each available device briefly and captures which one produced data.
+    // Used by onboarding wizard: "press any key on your keyboard".
+    else if (method == "POST" && path == "/api/v1/devices/capture") {
+        std::string j = "{\"found\":null,\"counts\":{}";
+        DWORD start = GetTickCount();
+        BYTE sampleBuf[8] = {0};
+        int bestGot = 0;
+        std::string bestPath;
+
+        const GUID* guids[] = { &GUID_DEVINTERFACE_WINUSB, &GUID_DEVINTERFACE_TARGET_WINUSB, &GUID_DEVINTERFACE_LIBUSB0, NULL };
+        for (int g = 0; guids[g]; g++) {
+            HDEVINFO hDev = SetupDiGetClassDevs(guids[g], NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+            if (hDev == INVALID_HANDLE_VALUE) continue;
+            SP_DEVICE_INTERFACE_DATA ifData = { sizeof(ifData) };
+            for (DWORD idx = 0; SetupDiEnumDeviceInterfaces(hDev, NULL, guids[g], idx, &ifData); idx++) {
+                DWORD needed = 0;
+                SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, NULL, 0, &needed, NULL);
+                if (!needed) continue;
+                std::vector<BYTE> buf(needed);
+                PSP_DEVICE_INTERFACE_DETAIL_DATA_A det = (PSP_DEVICE_INTERFACE_DETAIL_DATA_A)buf.data();
+                det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+                if (!SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, det, needed, NULL, NULL)) continue;
+
+                // Try opening and reading for 300ms
+                HANDLE h = CreateFileA(det->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+                if (h == INVALID_HANDLE_VALUE) continue;
+                WINUSB_INTERFACE_HANDLE wusb = NULL;
+                if (!WinUsb_Initialize(h, &wusb)) { CloseHandle(h); continue; }
+                // M3: фактический interrupt-IN pipe из дескриптора, не 0x81.
+                BYTE pipeId = QueryInterruptInPipe(wusb);
+                if (pipeId == 0xFF) { WinUsb_Free(wusb); CloseHandle(h); continue; }
+                ULONG timeoutMs = 300;
+                WinUsb_SetPipePolicy(wusb, pipeId, PIPE_TRANSFER_TIMEOUT, sizeof(timeoutMs), &timeoutMs);
+
+                OVERLAPPED ov = {0};
+                ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+                if (ov.hEvent) {
+                    ULONG got = 0;
+                    BOOL ok = WinUsb_ReadPipe(wusb, pipeId, sampleBuf, sizeof(sampleBuf), &got, &ov);
+                    if (ok && got > 0) {
+                        if (got > bestGot) { bestGot = (int)got; bestPath = det->DevicePath; }
+                    } else if (GetLastError() == ERROR_IO_PENDING) {
+                        DWORD wr = WaitForSingleObject(ov.hEvent, 300);
+                        if (wr == WAIT_OBJECT_0 && WinUsb_GetOverlappedResult(wusb, &ov, &got, FALSE) && got > 0) {
+                            if (got > bestGot) { bestGot = (int)got; bestPath = det->DevicePath; }
+                        }
+                        WinUsb_AbortPipe(wusb, pipeId);
+                        WaitForSingleObject(ov.hEvent, 50);
+                    }
+                    CloseHandle(ov.hEvent);
+                }
+                WinUsb_Free(wusb);
+                CloseHandle(h);
+            }
+            SetupDiDestroyDeviceInfoList(hDev);
+        }
+
+        if (!bestPath.empty()) {
+            j += ",\"found\":{\"path\":\"" + JsonEscape(bestPath) + "\",\"bytes\":" + std::to_string(bestGot) + "}";
+        }
+        j += "}";
+        HttpSendJson(cli, j);
+    }
+    // ---- Phase "HID-first": все устройства ввода (обычные + WinUSB) ----
+    // GET /api/v1/hid — клавиатуры, мыши, смарт-устройства с клавиатурой
+    // независимо от драйвера: status ready (WinUSB) | needs-driver | ordinary.
+    else if (method == "GET" && path == "/api/v1/hid") {
+        std::vector<InputDeviceRow> rows;
+        EnumerateInputDevices(rows);
+        std::string j = "{\"devices\":[";
+        bool first = true;
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            const InputDeviceRow& r = rows[i];
+            std::string status = r.winusb ? "ready"
+                : (r.kinds.find("keyboard") != std::string::npos ? "needs-driver" : "ordinary");
+            if (!first) j += ",";
+            first = false;
+            j += "{\"usbId\":\"" + JsonEscape(r.usbId) + "\"";
+            j += ",\"name\":\"" + JsonEscape(r.name) + "\"";
+            j += ",\"vid\":\"" + r.vid + "\"";
+            j += ",\"pid\":\"" + r.pid + "\"";
+            j += ",\"mi\":\"" + r.mi + "\"";
+            j += ",\"service\":\"" + JsonEscape(r.service) + "\"";
+            j += ",\"kinds\":\"" + r.kinds + "\"";
+            j += ",\"status\":\"" + status + "\"";
+            j += ",\"hidPath\":\"" + JsonEscape(r.hidPath) + "\"";
+            j += ",\"winusbPath\":\"" + JsonEscape(r.winusbPath) + "\"";
+            j += "}";
+        }
+        j += "]}";
+        HttpSendJson(cli, j);
+    }
+    // POST /api/v1/input/identify — сброс и старт окна прослушивания:
+    // пользователь жмёт клавишу, GET отдаёт источник (VID/PID).
+    else if (method == "POST" && path == "/api/v1/input/identify") {
+        EnterCriticalSection(&g_csIdentified);
+        g_identified.has = false;
+        g_identified.identifiable = false;
+        g_identified.seq = 0;
+        g_identified.lastVk = 0;
+        g_identified.lastMakeCode = 0;
+        g_identified.vid.clear(); g_identified.pid.clear(); g_identified.mi.clear();
+        g_identified.name.clear(); g_identified.path.clear();
+        g_identifyEvents.clear();
+        g_identifySeq = 0;
+        LeaveCriticalSection(&g_csIdentified);
+        HttpSendJson(cli, "{\"ok\":true,\"listening\":true}");
+    }
+    // GET /api/v1/input/identify — poll: живой фид нажатий + источник (VID/PID)
+    else if (method == "GET" && path == "/api/v1/input/identify") {
+        std::string j = "{";
+        EnterCriticalSection(&g_csIdentified);
+        j += std::string("\"listening\":") + (g_identified.has ? "true" : "false");
+        j += ",\"count\":" + std::to_string(g_identifySeq);
+        if (g_identified.has) {
+            j += ",\"identifiable\":" + std::string(g_identified.identifiable ? "true" : "false");
+            j += ",\"lastVk\":" + std::to_string(g_identified.lastVk);
+            j += ",\"lastMakeCode\":" + std::to_string(g_identified.lastMakeCode);
+            if (g_identified.identifiable) {
+                j += ",\"device\":{";
+                j += "\"vid\":\"" + g_identified.vid + "\"";
+                j += ",\"pid\":\"" + g_identified.pid + "\"";
+                j += ",\"mi\":\"" + g_identified.mi + "\"";
+                j += ",\"name\":\"" + JsonEscape(g_identified.name) + "\"";
+                j += ",\"path\":\"" + JsonEscape(g_identified.path) + "\"";
+                j += "}";
+            }
+        }
+        // live-поток последних нажатий
+        j += ",\"events\":[";
+        for (std::size_t i = 0; i < g_identifyEvents.size(); ++i) {
+            const IdentifyEvent& e = g_identifyEvents[i];
+            if (i) j += ",";
+            j += "{\"seq\":" + std::to_string(e.seq);
+            j += ",\"vk\":" + std::to_string(e.vk);
+            j += ",\"makeCode\":" + std::to_string(e.makeCode);
+            j += ",\"identifiable\":" + std::string(e.identifiable ? "true" : "false");
+            j += ",\"vid\":\"" + e.vid + "\"";
+            j += ",\"pid\":\"" + e.pid + "\"";
+            j += ",\"name\":\"" + JsonEscape(e.name) + "\"";
+            j += "}";
+        }
+        j += "]";
+        LeaveCriticalSection(&g_csIdentified);
+        j += "}";
+        HttpSendJson(cli, j);
+    }
+    // GET /api/v1/activity — недавно сработавшие actions (Live-экран)
+    else if (method == "GET" && path == "/api/v1/activity") {
+        std::vector<ActivityEvent> copy;
+        EnterCriticalSection(&g_csActivity);
+        copy = g_activityEvents;
+        LeaveCriticalSection(&g_csActivity);
+        std::string j = "{\"events\":[";
+        for (std::size_t i = 0; i < copy.size(); ++i) {
+            const ActivityEvent& e = copy[i];
+            if (i) j += ",";
+            j += "{\"seq\":" + std::to_string(e.seq);
+            j += ",\"t\":" + std::to_string(e.tick);
+            j += ",\"usage\":" + std::to_string(e.usage);
+            j += ",\"action\":\"" + JsonEscape(e.action) + "\"";
+            j += ",\"mode\":\"" + JsonEscape(e.mode) + "\"";
+            j += "}";
+        }
+        j += "]}";
+        HttpSendJson(cli, j);
+    }
+    // POST /api/v1/devices/activate — {vidpid}: сделать устройство активным:
+    // добавить VID/PID в config (DeviceVIDPID) и переподключить hot path.
+    else if (method == "POST" && path == "/api/v1/devices/activate") {
+        std::string vidpid, devPath;
+        JsonGetStr(body, "vidpid", vidpid);
+        JsonGetStr(body, "path", devPath);
+        std::string norm;
+        bool fmtOk = false;
+        if (!devPath.empty()) {
+            // Per-instance: полный путь устройства как паттерн (lowercase).
+            // FindDevicePath матчит substring — путь содержит серийник, так что
+            // попадает только этот конкретный экземпляр (две одинаковые клавиатуры).
+            for (std::size_t ci = 0; ci < devPath.size(); ++ci) {
+                char c = devPath[ci];
+                if (c != ' ' && c != '\t') norm += (char)tolower((unsigned char)c);
+            }
+            fmtOk = !norm.empty() && norm.size() <= 255;
+        } else {
+            // Формат: "vid_xxxx&pid_yyyy" (4 hex каждая).
+            for (std::size_t ci = 0; ci < vidpid.size(); ++ci) {
+                char c = vidpid[ci];
+                if (c != ' ' && c != '\t') norm += (char)tolower((unsigned char)c);
+            }
+            fmtOk = (norm.size() >= 17 && norm.compare(0, 4, "vid_") == 0);
+            if (fmtOk) {
+                std::size_t amp = norm.find("&pid_", 4);
+                if (amp == std::string::npos || amp + 9 > norm.size()) fmtOk = false;
+                else {
+                    for (std::size_t ci = 4; ci < amp && fmtOk; ++ci)
+                        if (!isxdigit((unsigned char)norm[ci])) fmtOk = false;
+                    for (std::size_t ci = amp + 5; ci < norm.size() && fmtOk; ++ci)
+                        if (!isxdigit((unsigned char)norm[ci])) fmtOk = false;
+                }
+            }
+        }
+        if (!fmtOk) {
+            HttpSendJson(cli, "{\"error\":\"invalid vidpid or device path\"}", 400);
+        } else {
+            DashOp* op = new DashOp();
+            op->op = DASH_ACTIVATE_DEVICE;
+            snprintf(op->action, sizeof(op->action), "%s", norm.c_str());
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok
+                ? "{\"ok\":true,\"pattern\":\"" + JsonEscape(norm) + "\"}"
+                : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            if (rr.ok) {
+                // ACTIVATE WARNING: если устройство видно в /api/v1/hid, но НЕ
+                // WinUSB-ready (status != ready), реконнект его не откроет —
+                // предупреждаем пользователя (остаёмся lenient: ok:true; если
+                // устройства в списке нет — паттерн может быть частичным).
+                std::vector<InputDeviceRow> rows;
+                EnumerateInputDevices(rows);
+                bool exactFound = false;
+                bool ready = false;
+                for (std::size_t ri = 0; ri < rows.size(); ++ri) {
+                    const InputDeviceRow& r = rows[ri];
+                    bool match = false;
+                    if (!devPath.empty()) {
+                        std::string hay = ToLower(r.hidPath.c_str()) + ToLower(r.winusbPath.c_str());
+                        match = !hay.empty() && hay.find(norm) != std::string::npos;
+                    } else {
+                        std::string rowPat = "vid_" + ToLower(r.vid.c_str()) + "&pid_" + ToLower(r.pid.c_str());
+                        match = (rowPat == norm);
+                    }
+                    if (match) { exactFound = true; if (r.winusb) ready = true; }
+                }
+                if (exactFound && !ready) {
+                    resp = "{\"ok\":true,\"pattern\":\"" + JsonEscape(norm)
+                        + "\",\"warning\":\"device is not on the WinUSB driver — run the driver swap first\"}";
+                }
+            }
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if (rr.callerOwnsOp) delete op;
+        }
+    }
+    // POST /api/v1/action/fire — {action, usage?, profile?} → выполнить действие
+    // «как будто нажата физическая клавиша» на активном (или указанном) профиле.
+    // Runtime-only: config не пишется. Используется Live click-to-fire.
+    else if (method == "POST" && path == "/api/v1/action/fire") {
+        std::string action, profile;
+        int usage = 0;
+        JsonGetStr(body, "action", action);
+        JsonGetStr(body, "profile", profile);
+        JsonGetInt(body, "usage", usage);
+        if (action.empty()) {
+            HttpSendJson(cli, "{\"error\":\"missing action\"}", 400);
+        } else {
+            DashOp* op = new DashOp();
+            op->op = DASH_FIRE_ACTION;
+            op->noPersist = true;
+            snprintf(op->action, sizeof(op->action), "%s", action.c_str());
+            snprintf(op->profile, sizeof(op->profile), "%s", profile.c_str());
+            op->usage = usage;
+            DashOpResult rr = RunDashOp(op);
+            std::string resp = rr.ok
+                ? "{\"ok\":true,\"fired\":true}"
+                : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}");
+            HttpSendJson(cli, resp, rr.ok ? 200 : 400);
+            if (rr.callerOwnsOp) delete op;
+        }
+    }
+    // ---- Phase 7: Diagnostics ----
+    // GET /api/v1/diagnostics — device/driver/config health snapshot
+    else if (method == "GET" && path == "/api/v1/diagnostics") {
+        std::string j = "{";
+        // Device state
+        bool devConnected = false; unsigned char devPipe = 0xFF;
+        DevInfoSnapshot(devConnected, devPipe);
+        std::string vidpid;
+        EnterCriticalSection(&g_csProfile); vidpid = g_deviceVidPid; LeaveCriticalSection(&g_csProfile);
+        j += "\"device\":\"" + std::string(devConnected ? "connected" : "disconnected") + "\"";
+        j += ",\"winusbHandle\":" + std::string(devConnected ? "true" : "false");
+        char pipeHex[8]; snprintf(pipeHex, sizeof(pipeHex), "0x%02X", devPipe);
+        j += ",\"pipeId\":\"" + std::string(pipeHex) + "\"";
+        j += ",\"vidpid\":\"" + JsonEscape(vidpid) + "\"";
+
+        // Device path (from SetupAPI)
+        std::string devPath;
+        if (FindDevicePath(devPath)) {
+            j += ",\"devicePath\":\"" + JsonEscape(devPath) + "\"";
+            j += ",\"deviceEnumerated\":true";
+        } else {
+            j += ",\"deviceEnumerated\":false";
+        }
+
+        // Config health
+        j += ",\"configFile\":\"" + std::string(CONFIG_FILE) + "\"";
+        DWORD attr = GetFileAttributesA(CONFIG_FILE);
+        j += ",\"configExists\":" + std::string(attr != INVALID_FILE_ATTRIBUTES ? "true" : "false");
+        size_t diagProfileCount, diagAppCount;
+        std::string diagActive;
+        EnterCriticalSection(&g_csProfile);
+        diagProfileCount = g_profiles.size();
+        diagAppCount = g_domain.applications.size();
+        diagActive = g_activeProfile;
+        LeaveCriticalSection(&g_csProfile);
+        j += ",\"profileCount\":" + std::to_string(diagProfileCount);
+        j += ",\"appCount\":" + std::to_string(diagAppCount);
+        j += ",\"activeProfile\":\"" + JsonEscape(diagActive) + "\"";
+
+        // Driver check: is MI_00 using WinUSB?
+        // Check registry for the device interface GUID
+        j += ",\"driverInfo\":{";
+        j += "\"note\":\"Check Device Manager > KeySidekick device > Driver. Should be WinUSB.sys\"";
+        j += ",\"winusbGuid\":\"{901A2603-A95E-4CA8-86BF-FB0547C06B64}\"";
+        j += "}";
+
+        // HTTP/API health
+        j += ",\"httpPort\":" + std::to_string(g_httpPort);
+        j += ",\"httpEnabled\":" + std::string(g_httpEnabled ? "true" : "false");
+        j += ",\"trayEnabled\":" + std::string(g_trayEnabled ? "true" : "false");
+
+        // Recent log lines (last 10)
+        j += ",\"recentLog\":[";
+        // Read last 10 lines from log file
+        {
+            FILE* lf = fopen(LOG_FILE, "r");
+            if (lf) {
+                // Read all lines, keep last 10
+                std::vector<std::string> lines;
+                char line[512];
+                while (fgets(line, sizeof(line), lf)) {
+                    std::string s(line);
+                    while (!s.empty() && (s.back()=='\n'||s.back()=='\r')) s.pop_back();
+                    lines.push_back(s);
+                }
+                fclose(lf);
+                std::size_t start = lines.size() > 10 ? lines.size() - 10 : 0;
+                bool firstLog = true;
+                for (std::size_t i = start; i < lines.size(); ++i) {
+                    if (!firstLog) j += ",";
+                    firstLog = false;
+                    j += "\"" + JsonEscape(lines[i]) + "\"";
+                }
+            }
+        }
+        j += "]";
+
+        j += "}";
+        HttpSendJson(cli, j);
+    }
+    // POST /api/capture/start
+    else if (method == "POST" && path == "/api/capture/start") {
+        g_capturedUsage = 0;
+        g_captureArmed = true;
+        HttpSendJson(cli, "{\"ok\":true,\"armed\":true}");
+    }
+    // GET /api/capture/poll
+    else if (method == "GET" && path == "/api/capture/poll") {
+        int u = g_capturedUsage.exchange(0);
+        if (u != 0) {
+            char j[128];
+            snprintf(j, sizeof(j), "{\"ready\":true,\"usage\":%d}", u);
+            HttpSendJson(cli, j);
+        } else {
+            HttpSendJson(cli, "{\"ready\":false}");
+        }
+    }
+    // Backwards-compat: GET /profiles (плоский текстовый список)
+    else if (method == "GET" && path == "/profiles") {
+        std::string list;
+        EnterCriticalSection(&g_csProfile);
+        for (auto& kv : g_profiles) { list += kv.first; list += "\n"; }
+        LeaveCriticalSection(&g_csProfile);
+        HttpSend(cli, list.c_str(), "text/plain");
+    }
+    else {
+        HttpSend(cli, "not found", "text/plain", 404);
+    }
+}
+
+static DWORD WINAPI HttpWorkerThread(LPVOID parameter) {
+    SOCKET cli = (SOCKET)(ULONG_PTR)parameter;
+    if (!g_running) {
+        closesocket(cli);
+    } else {
+        HandleHttpConnection(cli);
+    }
+    g_httpWorkersActive.fetch_sub(1);
+    ReleaseSemaphore(g_httpWorkerSemaphore, 1, NULL);
+    return 0;
+}
+
+
 static void StartHttp() {
     if (!g_httpEnabled) return;
     g_httpRunning = true;
-    CreateThread(NULL, 0, HttpThread, NULL, 0, NULL);
+    g_httpWorkerSemaphore = CreateSemaphoreW(NULL, 8, 8, NULL);
+    if (!g_httpWorkerSemaphore) {
+        Log("HTTP worker semaphore create failed");
+        g_httpRunning = false;
+        return;
+    }
+    g_httpThreadHandle = CreateThread(NULL, 0, HttpThread, NULL, 0, NULL);
+    if (!g_httpThreadHandle) {
+        CloseHandle(g_httpWorkerSemaphore);
+        g_httpWorkerSemaphore = NULL;
+        g_httpRunning = false;
+        Log("HTTP thread create failed");
+    }
 }
 
 // Разбор INI-ключа секции Keys → (usageId, modMask).
@@ -4806,7 +5077,6 @@ static void LoadConfigLegacy() {
 // =====================================================================
 static void ApplyGeneralSettings(const keysidekick::config::GeneralSettings& gs) {
     strncpy(g_deviceVidPid, gs.device_vid_pid.c_str(), sizeof(g_deviceVidPid)-1);
- g_deviceVidPid[sizeof(g_deviceVidPid)-1] = 0;
     g_deviceVidPid[sizeof(g_deviceVidPid)-1] = 0;
     // DefaultProfile: config хранит id, runtime использует name. Bridge маппит
     // profile.normal → "basic". Оставляем как есть (g_activeProfile выставит projection).
@@ -5078,6 +5348,9 @@ static void SyncRuntimeToDomain() {
 }
 
 static bool WriteConfig() {
+    // H3: весь проход под g_csProfile (reentrant) — с пулом HTTP-воркеров
+    // WriteConfig может вызываться конкурентно, а g_domain читается без лока.
+    EnterCriticalSection(&g_csProfile);
     // Sync runtime mutations → domain, then serialize through config_v3
     SyncRuntimeToDomain();
     keysidekick::config::Config config = keysidekick::bridge::DomainToConfig(g_domain, g_configGeneral);
@@ -5099,9 +5372,11 @@ static bool WriteConfig() {
         keysidekick::StorageResult result = keysidekick::AtomicWriteUtf8(wpath, legacyContent, nullptr);
         if (!result.ok()) {
             Log("WriteConfig legacy fallback FAILED: stage=%d err=%lu", (int)result.stage, result.win32Error);
+            LeaveCriticalSection(&g_csProfile);
             return false;
         }
         Log("Config written (legacy fallback) to %s", CONFIG_FILE);
+        LeaveCriticalSection(&g_csProfile);
         return true;
     }
 
@@ -5125,9 +5400,11 @@ static bool WriteConfig() {
     if (!result.ok()) {
         Log("WriteConfig FAILED: stage=%d err=%lu msg=%s",
             (int)result.stage, result.win32Error, result.message.c_str());
+        LeaveCriticalSection(&g_csProfile);
         return false;
     }
     Log("Config written atomically (v3) to %s", CONFIG_FILE);
+    LeaveCriticalSection(&g_csProfile);
     return true;
 }
 
@@ -5149,7 +5426,10 @@ static void ReadLoop() {
             DWORD err = GetLastError();
             if (err != ERROR_IO_PENDING) {
                 Log("ReadPipe err=%lu — reconnect", err);
-                if (!ReconnectDevice()) Sleep(2000);
+                // Если реконнект не удался (устройство физически пропало) —
+                // выходим в main-цикл: там событийное ожидание WM_DEVICECHANGE,
+                // никакого спина с поллингом SetupAPI.
+                if (!ReconnectDevice()) break;
                 continue;
             }
             readPending = true;
@@ -5193,7 +5473,11 @@ static void ReadLoop() {
                 Log("Reconnect requested (activation)");
                 CloseDevice();
             }
-            if (!ReconnectDevice()) { Log("Reconnect (activation) failed"); Sleep(2000); }
+            if (!ReconnectDevice()) {
+                Log("Reconnect (activation) failed — device gone, switching to event-driven wait");
+                BumpRevision();   // SSE clients: device state изменился
+                break;
+            }
             BumpRevision();   // SSE clients: device state изменился
         } else if (wr == WAIT_OBJECT_0 + 2) {
             MSG msg;
@@ -5248,9 +5532,12 @@ static void ReleaseAllKeys() {
 }
 
 static BOOL WINAPI ConsoleHandler(DWORD signal) {
+    // Console-control поток НЕ трогает WinUSB: только флаг + сообщение.
+    // AbortPipe выполнит main-поток в обработчике WM_USER_SHUTDOWN (владелец
+    // overlapped read) — иначе гонка с CloseDevice/WinUsb_Free (M3).
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
         g_running = false;
-        if (g_hWinUsb && g_interruptInPipe != 0xFF) WinUsb_AbortPipe(g_hWinUsb, g_interruptInPipe);
+        if (g_hMsgWindow) PostMessageW(g_hMsgWindow, WM_USER_SHUTDOWN, 0, 0);
     }
     return TRUE;
 }
@@ -5273,6 +5560,7 @@ int main(int argc, char* argv[]) {
         appInstance.RequestOpenDashboard();
         return 0;
     }
+    g_openDashboardMsg = appInstance.window_message();
     if (acquire.status == keysidekick::AppInstanceAcquireStatus::Error) {
         fprintf(stderr, "Singleton init failed (err=%lu). Another instance may be running.\n", acquire.win32_error);
         return 1;
@@ -5282,6 +5570,9 @@ int main(int argc, char* argv[]) {
     InitializeCriticalSection(&g_csRevision);
     InitializeCriticalSection(&g_csIdentified);
     InitializeCriticalSection(&g_csActivity);
+    InitializeCriticalSection(&g_csDevInfo);
+    InitializeCriticalSection(&g_csLog);
+    g_csLogReady = true;
     // C2: событие, через которое DashOp-активация просит ReadLoop переподключить
     // устройство (создаётся до StartHttp — DashOp не может прийти раньше).
     g_reconnectRequestEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -5305,30 +5596,66 @@ int main(int argc, char* argv[]) {
         g_profiles.size(), g_activeProfile.c_str(), (int)g_httpEnabled, (int)g_trayEnabled);
 
     // --- Always-on device loop: if device is absent, keep dashboard/tray
-    // alive and retry with bounded backoff instead of exiting. ---
+    // alive and retry with backoff instead of exiting. ---
+    // Idle-чистота: НИКАКОГО периодического поллинга. Цикл спит в
+    // MsgWaitForMultipleObjectsEx и просыпается ТОЛЬКО по сообщению
+    // (WM_DEVICECHANGE при plug/unplug, DashOp, tray) либо по экспоненциальному
+    // backoff-таймауту (2с → 60с) как страховка от пропущенного события.
+    static bool deviceAbsentLogged = false;
+    static bool openFailLogged = false;
     while (g_running) {
         std::string path;
         if (!FindDevicePath(path)) {
-            Log("Device not found, waiting...");
-            printf("Device not found. Dashboard at http://localhost:%d/ — waiting for device...\n", g_httpPort);
-            // Bounded backoff: retry every ~2 seconds (с подкачкой сообщений, чтобы
-            // DashOp/HTTP-мутации работали и при отсутствии устройства)
-            for (int i = 0; i < 30 && g_running; i++) {
-                PumpMessages();
-                Sleep(500);
-                if (FindDevicePath(path)) break;
+            if (!deviceAbsentLogged) {
+                Log("Device not found, waiting...");
+                printf("Device not found. Dashboard at http://localhost:%d/ — waiting for device...\n", g_httpPort);
+                deviceAbsentLogged = true;
             }
-            if (!g_running || path.empty()) {
+            DWORD backoffMs = 2000;
+            while (g_running && path.empty()) {
+                DWORD wr = MsgWaitForMultipleObjectsEx(0, NULL, backoffMs,
+                    QS_ALLINPUT | QS_ALLPOSTMESSAGE, 0);
+                if (wr == WAIT_OBJECT_0) {
+                    PumpMessages();
+                    if (g_deviceChangeNotified.exchange(false) && FindDevicePath(path)) break;
+                    continue;
+                }
                 if (!g_running) break;
-                continue; // keep waiting indefinitely
+                if (FindDevicePath(path)) break;
+                if (backoffMs < 60000) backoffMs *= 2;
             }
+            if (!g_running) break;
+            if (path.empty()) continue;
+            deviceAbsentLogged = false;
+        } else if (deviceAbsentLogged) {
+            deviceAbsentLogged = false;
         }
         if (!OpenDevice(path)) {
-            Log("Failed to open device, retry in 5s");
-            PumpMessages();
-            Sleep(1000);
+            if (!openFailLogged) {
+                Log("Failed to open device, retry in 5s");
+                openFailLogged = true;
+            }
+            // Тоже не поллим: ждём события/backoff (устройство видно, но не
+            // открывается — например, фантомная копия после Zadig).
+            DWORD backoffMs = 2000;
+            while (g_running) {
+                DWORD wr = MsgWaitForMultipleObjectsEx(0, NULL, backoffMs,
+                    QS_ALLINPUT | QS_ALLPOSTMESSAGE, 0);
+                if (wr == WAIT_OBJECT_0) {
+                    PumpMessages();
+                    if (g_deviceChangeNotified.exchange(false)) break;
+                    continue;
+                }
+                if (!g_running) break;
+                if (backoffMs < 10000) backoffMs *= 2;
+                break;   // backoff истёк — пробуем открыть снова
+            }
             continue;
         }
+        openFailLogged = false;
+        // Сбрасываем resume-флаг, выставленный WM_POWERBROADCAST при отсутствии
+        // устройства — иначе первый же read-error даст ложный reconnect.
+        g_powerResume = false;
         // C2: если реконнект-активация была запрошена, пока устройство
         // отсутствовало, успешный OpenDevice выше её уже удовлетворил —
         // сбрасываем флаг/событие, чтобы ReadLoop не делал лишний teardown.
@@ -5341,18 +5668,36 @@ int main(int argc, char* argv[]) {
         CloseDevice();
 
         if (g_running) {
-            Log("Device lost, attempting reconnect...");
+            Log("Device lost — switching to event-driven wait");
             PumpMessages();
-            Sleep(1000);
         }
     }
 
     ReleaseAllTargetedKeys();
     ReleaseAllKeys();
     RemoveTray();
+    // H3: аккуратная остановка HTTP — дождаться SSE-клиентов и воркеров,
+    // join accept-потока, и ТОЛЬКО ПОТОМ удалять критические секции (M4).
     g_httpRunning = false;
+    for (int i = 0; i < 30 && g_sseClientCount > 0; ++i) Sleep(100);
+    for (int i = 0; i < 30 && g_httpWorkersActive.load() > 0; ++i) Sleep(100);
+    if (g_httpThreadHandle) {
+        WaitForSingleObject(g_httpThreadHandle, 3000);
+        CloseHandle(g_httpThreadHandle);
+        g_httpThreadHandle = NULL;
+    }
+    if (g_httpWorkerSemaphore) {
+        CloseHandle(g_httpWorkerSemaphore);
+        g_httpWorkerSemaphore = NULL;
+    }
     Log("Stopped");
     DeleteCriticalSection(&g_csRevision);
     DeleteCriticalSection(&g_csProfile);
+    DeleteCriticalSection(&g_csIdentified);
+    DeleteCriticalSection(&g_csActivity);
+    DeleteCriticalSection(&g_csDevInfo);
+    // g_csLog НЕ удаляем: отставший HTTP-воркер (DashOp-таймаут до 15с) может
+    // вызвать Log() уже после drain'а — EnterCriticalSection на удалённой
+    // секции это UB. Утечка одной секции при выходе процесса безвредна.
     return 0;
 }

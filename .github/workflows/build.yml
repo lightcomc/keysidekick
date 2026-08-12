@@ -2,7 +2,7 @@ name: build
 
 # Top-level permissions reset every unspecified scope to none, so BOTH
 # contents and actions must be granted explicitly:
-#   contents:write -> softprops/action-gh-release needs it to create the draft release
+#   contents:write -> softprops/action-gh-release needs it to publish the release (draft: false)
 #   actions:write  -> actions/upload-artifact@v4 needs it to upload artifacts
 permissions:
   contents: write
@@ -46,15 +46,13 @@ jobs:
           try { cmd /c build.bat } finally { Pop-Location }
           if ($LASTEXITCODE -ne 0) { throw "src\build.bat failed with exit code $LASTEXITCODE" }
 
-      - name: Verify embedded dashboard is up to date
-        shell: powershell
-        run: |
-          $env:PATH = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;$env:PATH"
-          Push-Location src
-          try { cmd /c build.bat --check-dashboard } finally { Pop-Location }
-          if ($LASTEXITCODE -ne 0) { throw "build.bat --check-dashboard failed with exit code $LASTEXITCODE" }
+      # No staleness gate here: build.bat always regenerates
+      # src/dashboard_embedded.generated.h from web/ sources on every build, so a
+      # "verify embedded dashboard is up to date" step in CI is vacuous — the
+      # generated header is gitignored and absent on a fresh checkout.
+      # build.bat --check-dashboard remains a local pre-commit lint.
 
-      - name: Unit tests (13 suites)
+      - name: Unit tests (14 suites)
         shell: msys2 {0}
         run: |
           set -e
@@ -65,8 +63,9 @@ jobs:
         shell: msys2 {0}
         run: |
           set -e
-          # Fresh config for the run; the suite mutates src/config.ini (CRUD)
-          # and restores nothing, so start from a clean copy every time.
+          # The suite snapshots src/config.ini and restores it byte-for-byte
+          # via a trap on EXIT. Start from a clean copy of the example config
+          # so the run begins from a known-good state.
           cp src/config.example.ini src/config.ini
           # sidekick.exe resolves config.ini relative to its CWD -> run from src/
           cd src
@@ -99,6 +98,23 @@ jobs:
             dist/*.zip
             dist/*.sha256
           if-no-files-found: error
+
+      - name: Validate release metadata (tag == APP_VERSION, notes mention version)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $version = $tag -replace '^v', ''
+          $app = Select-String -Path src/sidekick.cpp -Pattern 'APP_VERSION\s*=\s*"([^"]+)"' |
+                 Select-Object -First 1
+          if (-not $app) { throw 'APP_VERSION not found in src/sidekick.cpp' }
+          if ($app.Matches[0].Groups[1].Value -ne $version) {
+            throw "tag $tag but APP_VERSION=$($app.Matches[0].Groups[1].Value) — bump src/sidekick.cpp APP_VERSION"
+          }
+          $notes = Get-Content -Raw RELEASE-NOTES-template.md
+          if ($notes -notmatch [regex]::Escape($version)) {
+            throw "RELEASE-NOTES-template.md does not mention version $version — update release notes before tagging"
+          }
 
       - name: Publish release (tag push only)
         if: startsWith(github.ref, 'refs/tags/v')

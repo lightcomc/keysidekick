@@ -62,7 +62,7 @@ See [`docs/PROBLEM-AND-SOLUTION.md`](docs/PROBLEM-AND-SOLUTION.md) for the full 
   - **System tray icon** — left-click → dashboard; right-click → menu with profiles and mode indicators
   - **Local HTTP API** on `127.0.0.1` — CSRF-protected, SSE-enabled
 - **Reliability:**
-  - Always-on device loop — app stays alive even if keyboard disconnected
+  - Always-on device loop — app stays alive even if keyboard disconnected; event-driven idle (no polling, zero disk/CPU churn while nothing happens)
   - Singleton mutex — no duplicate instances
   - Injection ownership ledger — releases only keys it injected, never main-keyboard modifiers
   - Atomic config write — temp → validate → replace with backup
@@ -194,7 +194,7 @@ Or directly: `sidekick.exe` (from the directory containing `config.ini`).
   curl -X POST http://127.0.0.1:8765/api/v1/devices/activate -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{"vidpid":"vid_xxxx&pid_yyyy"}'
   curl -X POST http://127.0.0.1:8765/api/v1/preset/apply -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{"agentId":"codex","name":"Codex pad"}'
   ```
-  > **For developers:** `tests/http_integration_tests.sh` runs against a live instance and **mutates `src/config.ini`** — back it up first.
+  > **For developers:** `tests/http_integration_tests.sh` runs against a live instance; it snapshots `src/config.ini` and restores it automatically on exit — no manual backup needed.
 - **Keys** — whatever you mapped to `!switch:`/`!toggle:` in the active profile.
 
 ---

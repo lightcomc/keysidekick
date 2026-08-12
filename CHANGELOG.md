@@ -7,11 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-12
+
+### Security
+
+- **Dashboard XSS closed** — window-picker inline handlers escaped `&` and `"` (crafted window class names could run script in the dashboard origin and steal the CSRF token).
+- **SSE CORS** — `Access-Control-Allow-Origin` is echoed only for loopback origins, never `*`; evil-origin requests are rejected by the security pipeline with 403.
+- **CSRF coverage widened** — every POST-only route (v1 CRUD, presets, activate, fire, capture) returns 405 on GET/HEAD via a declarative `IsPostOnlyPath` list.
+- **HTTP worker pool (slowloris)** — connection handling moved to a bounded pool of 8 workers; a slow client no longer stalls the whole dashboard; pool overflow rejects instantly. `WriteConfig`, device-info reads and the state revision are synchronized for concurrent handlers.
+- **Clean shutdown** — SSE clients and HTTP workers are drained, the accept thread is joined, and critical sections are deleted only afterwards; the console handler no longer races WinUSB teardown (abort happens on the owning thread via `WM_USER_SHUTDOWN`).
+- **JSON hardening** — `JsonGetStr` fully decodes escapes (`\uXXXX`, surrogate pairs); `JsonEscape` escapes `<`, `>`, `&`; user-controlled strings are never truncated by fixed buffers in `/api/status`, `/api/v1/state`, `/foreground`, `test-resolve`.
+- **Predictable temp file fixed** — config writes use an unpredictable temp name plus `CREATE_NEW` retry, closing the pre-created-junction race.
+- **Targeted dashboard-open message** — second-instance "open dashboard" uses `FindWindow` instead of `HWND_BROADCAST` (and the receiver was missing entirely — wired now).
+
+### Fixed
+
+- **Auto-start toggle was inverted** — the dashboard sent a JSON boolean, the server parsed strings: enabling auto-start deleted the shortcut while reporting success. `JsonGetBool`/`JsonGetInt` now accept booleans, and the UI surfaces the real `installed` state.
+- **`GET /api/v1/windows/foreground` was missing `processPath`** — the launch picker feature was dead; the field is included now.
+- **DashOp buffers** — all `strncpy` fills of fixed buffers replaced with terminating `snprintf`; `MultiByteToWideChar` results checked in launch/window lookup.
+- **Truncated request bodies** — a clean close with an incomplete body is no longer dispatched (partial config import could corrupt `config.ini`).
+- **SSE hot-path** — pushes use non-blocking sockets and drop slow clients instead of stalling the device loop (up to 1.6s per keystroke).
+- **Startup-manager test suite was orphaned** — wired into the runner (14 suites).
+- **Idle cleanliness (event-driven)** — with the keyboard disconnected the app no longer polls SetupAPI every 500ms or writes logs periodically: it sleeps in `MsgWaitForMultipleObjectsEx` and wakes on `WM_DEVICECHANGE` with exponential backoff (2s→60s) as a safety net. Auto-switch caches the foreground HWND (no per-second process queries). Measured idle: 0 disk I/O, ~0% CPU.
+- **Device-loss path** — a failed reconnect now returns to the event-driven wait instead of spinning in the read loop.
+- **Onboarding honesty** — "Control an app" and "Custom mix" now really create the profile + application target and activate it; the final screen checks the real auto-start state instead of claiming it; all wizard/identify/capture polls stop when leaving their screens.
+
+### Changed
+
+- **Trilingual presentation** (`presentation.html`) with a language switcher; English preset descriptions.
+- **Docs sync** — CHANGELOG 0.9.1 claim corrected (legacy GET `/switch` returns 405), FAQ points at `/api/v1/state`, READMEs describe the event-driven idle model and the auto-restoring integration suite.
+- **CI** — release metadata validation (tag == `APP_VERSION`, release notes must mention the version); the vacuous dashboard-staleness step was removed; release ZIP now ships Corresponding Source (GPL-3.0 §6).
+
 ## [0.9.1] - 2026-08-11
 
 ### Changed
 
-- **Security hardening** — CSRF token (`X-KeySidekick-Token`) enforced on all mutating routes: every `POST` is rejected with 403 without a valid token, plus Origin allow-listing; profile switching is POST-only via `POST /api/profile/activate` (legacy GET `/switch` kept only as undocumented backward-compat).
+- **Security hardening** — CSRF token (`X-KeySidekick-Token`) enforced on all mutating routes: every `POST` is rejected with 403 without a valid token, plus Origin allow-listing; profile switching is POST-only via `POST /api/profile/activate` (legacy GET `/switch` and GET `/profile` now return 405; the only switch path is `POST /api/profile/activate`).
 - **WinUSB teardown fix** — pending interrupt reads are aborted (`WinUsb_AbortPipe`) before `WinUsb_Free`/`CloseHandle` on shutdown and power-resume paths, so the device handle is released cleanly.
 - **HTTP/SSE robustness** — the SSE stream (`/api/v1/events`) keeps connections alive, and the device loop no longer exits when the keyboard is absent — it retries with bounded backoff while the dashboard/HTTP keep working.
 - **Hardware-binding cleanup** — no author hardware in defaults or examples: the `DeviceVIDPID` default is now empty (read from config) and `config.example.ini`/README ship the `vid_xxxx&pid_yyyy` placeholder.

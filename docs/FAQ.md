@@ -47,7 +47,7 @@ To verify it's not the router: kill `sidekick.exe`. If the main keyboard still t
 ### My target-app keys also type into the foreground window
 
 That shouldn't happen in `targeted` mode — the keys go to the target window via `PostMessage` and never reach the foreground. If you see double input:
-- You're probably in `basic` profile (check the tray tooltip / `curl http://127.0.0.1:8765/profile`). Switch to the targeted profile.
+- You're probably in `basic` profile (check the tray tooltip or `curl http://127.0.0.1:8765/api/v1/state`, which returns the active profile name). Switch to the targeted profile.
 - Or the key has no mapping in the active profile, so in basic mode it falls through to re-injection. Add a mapping or stay on the targeted profile.
 
 ### Does holding a key work in targeted mode?

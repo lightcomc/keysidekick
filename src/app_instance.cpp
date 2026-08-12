@@ -209,7 +209,13 @@ bool AppInstance::RequestOpenDashboard() {
     const BOOL signaled = SetEvent(eventHandle);
     CloseHandle(eventHandle);
     if (signaled && window_message_ != 0) {
-        PostMessageW(HWND_BROADCAST, window_message_, 0, 0);
+        // Точечная доставка вместо HWND_BROADCAST: сообщение получает только
+        // окно KeySidekick (класс окна из src/sidekick.cpp MSG_WND_CLASS),
+        // а не любой процесс в сессии.
+        HWND target = FindWindowW(L"WinUsbRouterMsgSink", NULL);
+        if (target != NULL) {
+            PostMessageW(target, window_message_, 0, 0);
+        }
     }
     return signaled != FALSE;
 }

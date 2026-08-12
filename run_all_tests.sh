@@ -60,6 +60,7 @@ run_test action_parser        "tests/action_parser_tests.cpp src/action_parser.c
 
 echo "--- Lifecycle modules ---"
 run_test runtime_state       "tests/runtime_state_tests.cpp src/runtime_state.cpp src/mingw_threading.h" "" "-O2"
+run_test startup_manager     "tests/startup_manager_tests.cpp src/startup_manager.cpp" "-lole32 -luuid -loleaut32 -ltaskschd" "-std=c++17"
 
 echo ""
 echo "=== Results: $passed passed, $failed failed ==="

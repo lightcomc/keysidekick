@@ -99,7 +99,7 @@ footer{padding:36px 0 54px;color:var(--muted);font-size:12px;border-top:1px soli
       <div class="stat"><b>~5k</b><span>lines in sidekick.cpp</span></div>
       <div class="stat"><b>0 kB</b><span>of kernel, LL hooks, filter drivers</span></div>
       <div class="stat"><b>15</b><span>preset templates «key → action»</span></div>
-      <div class="stat"><b>13 unit + 44 integration</b><span>live API checks</span></div>
+      <div class="stat"><b>14 unit + 53 integration</b><span>live API checks</span></div>
     </div>
   </div>
 </div>
@@ -215,7 +215,7 @@ curl -X POST http://127.0.0.1:8765/api/v1/preset/apply \
     <div class="grid3">
       <div class="card"><h3><span class="pic">🧠</span> <code>src/sidekick.cpp</code></h3><p>~5k lines: WinUSB pipe, async HID reading, key-diff, per-profile dispatch, HTTP server on WS2_32, SSE, SSE token, tray, master marshaling of writes into the main thread (WM_DASH_OP).</p></div>
       <div class="card"><h3><span class="pic">🌐</span> <code>web/</code> dashboard</h3><p>One HTML page: <code>app.js</code> (dashboard + onboarding + Live + preset wizard + action builder) + <code>styles.css</code>. Bundled into <code>dashboard_embedded.generated.h</code> via PowerShell.</p></div>
-      <div class="card"><h3><span class="pic">🧪</span> <code>tests/</code></h3><p>13 unit tests (config bridge, domain, windows_targets) + <code>http_integration_tests.sh</code> — 44 live-API checks: profile creation, mappings, presets, fire-action, export/import, devices.</p></div>
+      <div class="card"><h3><span class="pic">🧪</span> <code>tests/</code></h3><p>14 unit tests (config bridge, domain, windows_targets) + <code>http_integration_tests.sh</code> — 53 live-API checks: profile creation, mappings, presets, fire-action, export/import, devices.</p></div>
     </div>
     <h2 style="font-size:22px;margin-top:34px">Data flow</h2>
     <pre><code>Spare keyboard (WinUSB)
@@ -252,7 +252,7 @@ build.bat
 <pre><code>cd tests
 run_all_tests.sh            # unit (13) + config round-trip
 # integration: run sidekick.exe first, then
-http_integration_tests.sh   # 44 live-API checks</code></pre>
+http_integration_tests.sh   # 53 live-API checks</code></pre>
         <p>Unit tests cover config v3 (parsing/serialization), domain bridge, windows_targets resolver. Integration tests hit the real HTTP server: profile CRUD, keys, presets, fire-action, export/import, diagnostics.</p>
       </div>
       <div class="card"><h3><span class="pic">🚀</span> First run</h3>
@@ -292,7 +292,7 @@ run.bat</code></pre>
       <div class="stat"><b>~5k</b><span>строк в sidekick.cpp</span></div>
       <div class="stat"><b>0 kB</b><span>ядра, LL-хуков, фильтр-драйверов</span></div>
       <div class="stat"><b>15</b><span>пресетов-шаблонов «клавиша → действие»</span></div>
-      <div class="stat"><b>13 unit + 44 integration</b><span>проверок живого API</span></div>
+      <div class="stat"><b>14 unit + 53 integration</b><span>проверок живого API</span></div>
     </div>
   </div>
 </div>
@@ -408,7 +408,7 @@ curl -X POST http://127.0.0.1:8765/api/v1/preset/apply \
     <div class="grid3">
       <div class="card"><h3><span class="pic">🧠</span> <code>src/sidekick.cpp</code></h3><p>~5k строк: WinUSB-пайп, async-чтение HID, дифф нажатий, диспетчеризация по профилям, HTTP-сервер на WS2_32, SSE, SSE-токен, трей, мастер-маршалинг записей в main thread (WM_DASH_OP).</p></div>
       <div class="card"><h3><span class="pic">🌐</span> <code>web/</code> dashboard</h3><p>Одна HTML-страница: <code>app.js</code> (дашборд + onboarding + Live + preset-wizard + action builder) + <code>styles.css</code>. Собирается в <code>dashboard_embedded.generated.h</code> через PowerShell.</p></div>
-      <div class="card"><h3><span class="pic">🧪</span> <code>tests/</code></h3><p>13 unit-тестов (config bridge, domain, windows_targets) + <code>http_integration_tests.sh</code> — 44 проверки живого API: создание профилей, маппинги, пресеты, fire-action, экспорт/импорт, devices.</p></div>
+      <div class="card"><h3><span class="pic">🧪</span> <code>tests/</code></h3><p>14 unit-тестов (config bridge, domain, windows_targets) + <code>http_integration_tests.sh</code> — 53 проверки живого API: создание профилей, маппинги, пресеты, fire-action, экспорт/импорт, devices.</p></div>
     </div>
     <h2 style="font-size:22px;margin-top:34px">Поток данных</h2>
     <pre><code>Запасная клавиатура (WinUSB)
@@ -445,7 +445,7 @@ build.bat
 <pre><code>cd tests
 run_all_tests.sh            # unit (13) + config round-trip
 # интеграция: запустить sidekick.exe, затем
-http_integration_tests.sh   # 44 проверки живого API</code></pre>
+http_integration_tests.sh   # 53 проверки живого API</code></pre>
         <p>Unit-тесты покрывают конфиг v3 (парсинг/сериализация), domain bridge, windows_targets резолвер. Интеграционные — реальный HTTP-сервер: CRUD профилей, ключи, пресеты, fire-action, экспорт/импорт, диагностика.</p>
       </div>
       <div class="card"><h3><span class="pic">🚀</span> Первый запуск</h3>
@@ -485,7 +485,7 @@ run.bat</code></pre>
       <div class="stat"><b>~5k</b><span>sidekick.cpp 的代码行数</span></div>
       <div class="stat"><b>0 kB</b><span>内核、LL 钩子、过滤驱动：零占用</span></div>
       <div class="stat"><b>15</b><span>个「按键 → 动作」预设模板</span></div>
-      <div class="stat"><b>13 unit + 44 integration</b><span>项真实 API 检查</span></div>
+      <div class="stat"><b>14 unit + 53 integration</b><span>项真实 API 检查</span></div>
     </div>
   </div>
 </div>
@@ -601,7 +601,7 @@ curl -X POST http://127.0.0.1:8765/api/v1/preset/apply \
     <div class="grid3">
       <div class="card"><h3><span class="pic">🧠</span> <code>src/sidekick.cpp</code></h3><p>约 5k 行：WinUSB 管道、异步 HID 读取、按键差分、按配置文件分发、基于 WS2_32 的 HTTP 服务器、SSE、SSE 令牌、托盘、写操作主线程编组（WM_DASH_OP）。</p></div>
       <div class="card"><h3><span class="pic">🌐</span> <code>web/</code> 仪表盘</h3><p>单个 HTML 页面：<code>app.js</code>（仪表盘 + 引导 + Live + 预设向导 + 动作编辑器）+ <code>styles.css</code>。通过 PowerShell 打包进 <code>dashboard_embedded.generated.h</code>。</p></div>
-      <div class="card"><h3><span class="pic">🧪</span> <code>tests/</code></h3><p>13 个单元测试（config bridge、domain、windows_targets）+ <code>http_integration_tests.sh</code>——44 项真实 API 检查：创建配置文件、映射、预设、fire-action、导出/导入、设备。</p></div>
+      <div class="card"><h3><span class="pic">🧪</span> <code>tests/</code></h3><p>14 个单元测试（config bridge、domain、windows_targets）+ <code>http_integration_tests.sh</code>——53 项真实 API 检查：创建配置文件、映射、预设、fire-action、导出/导入、设备。</p></div>
     </div>
     <h2 style="font-size:22px;margin-top:34px">数据流</h2>
     <pre><code>备用键盘（WinUSB）
@@ -638,7 +638,7 @@ build.bat
 <pre><code>cd tests
 run_all_tests.sh            # 单元测试（13）+ 配置往返
 # 集成：先运行 sidekick.exe，然后
-http_integration_tests.sh   # 44 项真实 API 检查</code></pre>
+http_integration_tests.sh   # 53 项真实 API 检查</code></pre>
         <p>单元测试覆盖配置 v3（解析/序列化）、domain bridge、windows_targets 解析器。集成测试针对真实 HTTP 服务器：配置文件增删改查、按键、预设、fire-action、导出/导入、诊断。</p>
       </div>
       <div class="card"><h3><span class="pic">🚀</span> 首次运行</h3>

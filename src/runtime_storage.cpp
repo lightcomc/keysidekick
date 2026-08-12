@@ -26,14 +26,18 @@ std::wstring UniqueTempPath(const std::wstring& target) {
         base = target.substr(0, dot);
         ext = target.substr(dot);
     }
-    wchar_t suffix[40];
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    DWORD pid = GetCurrentProcessId();
+    // Непредсказуемое имя: QPC (наносекундное разрешение) + tick + pid + счётчик.
+    // Вместе с CREATE_NEW ниже это исключает junction/предсоздание гонку —
+    // атакующий не может угадать имя заранее.
+    static LONG counter = 0;
+    const LONG seq = InterlockedIncrement(&counter);
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    wchar_t suffix[96];
     swprintf(suffix, sizeof(suffix)/sizeof(suffix[0]),
-             L".tmp_%04u%02u%02u%02u%02u%02u%03u_%lu",
-             st.wYear, st.wMonth, st.wDay,
-             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, pid);
+             L".tmp_%016llx_%08lx_%lx",
+             (unsigned long long)qpc.QuadPart,
+             GetTickCount(), (unsigned long)(GetCurrentProcessId() ^ seq));
     return base + suffix + ext;
 }
 
@@ -132,13 +136,23 @@ StorageResult AtomicWriteUtf8(const std::wstring& target_path,
     StorageResult result;
     result.win32Error = ERROR_SUCCESS;
 
-    const std::wstring temp_path = UniqueTempPath(target_path);
+    std::wstring temp_path = UniqueTempPath(target_path);
     result.tempPath = temp_path;
 
-    // Open temp file for writing
+    // Open temp file for writing. CREATE_NEW: при коллизии имени (предсозданный
+    // файл/junction) перегенерируем имя и пробуем снова — без CREATE_ALWAYS,
+    // который молча перезаписал бы чужой файл.
     result.stage = OpenTempForWrite;
-    HANDLE h = CreateFileW(temp_path.c_str(), GENERIC_WRITE, 0,
-                           NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (attempt > 0) temp_path = UniqueTempPath(target_path);
+        h = CreateFileW(temp_path.c_str(), GENERIC_WRITE, 0,
+                        NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) break;
+        DWORD createErr = GetLastError();
+        if (createErr != ERROR_FILE_EXISTS && createErr != ERROR_ALREADY_EXISTS) break;
+    }
+    result.tempPath = temp_path;
     if (h == INVALID_HANDLE_VALUE) {
         result.win32Error = GetLastError();
         result.message = "Failed to create temp file";
