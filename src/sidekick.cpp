@@ -46,6 +46,7 @@
 #include "windows_targets.h"
 #include "http_security.h"
 #include "action_parser.h"
+#include "report_diff.h"
 
 // ---- WinUSB interface GUIDs ----
 DEFINE_GUID(GUID_DEVINTERFACE_WINUSB,
@@ -61,6 +62,12 @@ DEFINE_GUID(GUID_DEVINTERFACE_TARGET_WINUSB,
 // =====================================================================
 static char  g_deviceVidPid[128] = "";  // set from config DeviceVIDPID (no author-hardware default)
 static int   g_httpPort          = 8765;
+// Порт, на котором listener реально поднялся (0 = ещё не слушает). Listener
+// биндится один раз при старте и не переезжает: config.ini может быть
+// перезаписан/импортирован с другим HTTPPort в рантайме, и тогда security-
+// policy, диагностика и URL-ы обязаны опираться на этот живой порт, а не на
+// значение из конфига.
+static int   g_httpPortBound     = 0;
 static bool  g_httpEnabled       = true;
 static bool  g_trayEnabled       = true;
 static bool  g_logEnabled        = true;
@@ -128,6 +135,11 @@ void Log(const char* fmt, ...) {
         fclose(f);
     }
     if (g_csLogReady) LeaveCriticalSection(&g_csLog);
+}
+
+// Порт живого listener'а (см. g_httpPortBound).
+static int LiveHttpPort() {
+    return g_httpPortBound != 0 ? g_httpPortBound : g_httpPort;
 }
 
 static void Trim(char* s) {
@@ -612,7 +624,7 @@ static ScanInfo UsageToSet1(int usage) {
         {0x42,0x43,false},{0x43,0x44,false},{0x44,0x57,false},{0x45,0x58,false},
         {0x46,0xE037,true},  // PrintScreen (extended)
         {0x47,0x46,false},   // ScrollLock
-        {0x48,0xE052,true},  // Pause (extended; обычно)
+        {0x48,0x45,false},   // Pause (Set-1 make 0x45; the E1 prefix is not representable here)
         // nav cluster (extended)
         {0x49,0xE052,true}, // Insert
         {0x4A,0xE047,true}, // Home
@@ -621,7 +633,7 @@ static ScanInfo UsageToSet1(int usage) {
         {0x4D,0xE04F,true}, // End
         {0x4E,0xE051,true}, // PageDown
         // arrows (extended)
-        {0x4F,0xE04F,true}, // Right
+        {0x4F,0xE04D,true}, // Right
         {0x50,0xE04B,true}, // Left
         {0x51,0xE050,true}, // Down
         {0x52,0xE048,true}, // Up
@@ -1052,6 +1064,11 @@ static int  g_prevReport[6] = {0,0,0,0,0,0};
 
 // Ownership ledger: tracks only keys we injected so ReleaseAllKeys
 // releases only those, not main-keyboard modifiers.
+// g_csLedger сериализует оба ledger'а: их мутируют и read-поток (hot path), и
+// HTTP-воркеры (/api/v1/devices/detect|capture → ReleaseAllKeys), а также
+// reload/main-thread. Захватывать только на время работы с ledger, никогда во
+// время SendInput/PostMessage.
+static CRITICAL_SECTION g_csLedger;
 static keysidekick::InputLedger g_injectedKeys;
 static keysidekick::TargetedInputLedger g_targetedKeys;
 static std::uint32_t g_targetedRepeatDelayMs = 500;
@@ -1059,7 +1076,12 @@ static std::uint32_t g_targetedRepeatIntervalMs = 100;
 
 static void SendOneScan(unsigned short scan, bool extended, bool keyUp) {
     keysidekick::ScanKey key(scan & 0xFF, extended);
-    if (keyUp && !g_injectedKeys.owns(key)) return;
+    if (keyUp) {
+        EnterCriticalSection(&g_csLedger);
+        const bool owned = g_injectedKeys.owns(key);
+        LeaveCriticalSection(&g_csLedger);
+        if (!owned) return;   // чужая клавиша (главная клавиатура) — не трогаем
+    }
 
     INPUT in = {0};
     in.type = INPUT_KEYBOARD;
@@ -1071,72 +1093,57 @@ static void SendOneScan(unsigned short scan, bool extended, bool keyUp) {
 
     // Track ownership: record down/up so ReleaseAllKeys can release only
     // keys we actually injected (not main-keyboard modifiers).
+    EnterCriticalSection(&g_csLedger);
     if (!keyUp) g_injectedKeys.recordDown(key);
     else        g_injectedKeys.recordUp(key);
+    LeaveCriticalSection(&g_csLedger);
 }
 
 // Basic re-inject всего отчёта, исключая usageIds из exceptSet (которые обрабатываются как action).
-// ВАЖНО: если в отчёте есть action-key, модификаторы НЕ инжектятся в систему —
-// иначе KEYDOWN-модификатор потом невозможно снять (SendInput KEYUP ненадёжен
-// для scan-based событий), и он залипает. Модификаторы обновляются только в
-// g_prevModifiers для корректного edge-detection, но в систему не уходят.
+// ВАЖНО: consumed-клавиши не инжектятся, но остаются в g_prevReport —
+// иначе следующая смена состояния любой другой клавиши снова выглядит как
+// keydown-front этой клавиши и action повторяется (повторный запуск/макрос).
 static void BasicReinject(const BYTE* report, DWORD len, const std::vector<int>& exceptUsages) {
     if (len < 2) return;
 
-    BYTE mod = report[0];
-    bool hasActionKey = !exceptUsages.empty();
+    const BYTE mod = report[0];
 
     // --- Modifiers diff (byte 0) ---
-    if (!hasActionKey) {   // инжектим модификаторы только если нет action-клавиши
-        BYTE modDelta = mod ^ g_prevModifiers;
-        if (modDelta) {
-            for (auto& mb : MOD_BITS) {
-                if (modDelta & mb.mask) {
-                    ScanInfo si = UsageToSet1(mb.usage);
-                    bool keyUp = !(mod & mb.mask);   // бит снят → keyup
-                    SendOneScan(si.scan, si.extended, keyUp);
-                }
+    // Диф модификаторов выполняется ВСЕГДА: keydown и keyup одной и той же
+    // группы обязаны идти парой, иначе инжектированный модификатор остаётся
+    // зажатым в системе (SendOneScan всё равно не отпустит чужую клавишу —
+    // ledger владеет только тем, что мы сами отправили).
+    const BYTE modDelta = mod ^ g_prevModifiers;
+    if (modDelta) {
+        for (auto& mb : MOD_BITS) {
+            if (modDelta & mb.mask) {
+                ScanInfo si = UsageToSet1(mb.usage);
+                bool keyUp = !(mod & mb.mask);   // бит снят → keyup
+                SendOneScan(si.scan, si.extended, keyUp);
             }
         }
     }
-    g_prevModifiers = mod;   // всегда обновляем edge-detect (даже если не инжектили)
+    g_prevModifiers = mod;
 
     // --- Keys diff (bytes 2-7) ---
-    int cur[6] = {0,0,0,0,0,0};
-    int ncur = 0;
-    for (int i = 2; i < 8 && i < (int)len; i++) {
-        if (report[i] != 0 && ncur < 6) {
-            int uid = report[i];
-            // пропустить usage из exceptUsages (они обработаны как action)
-            bool skip = false;
-            for (int e : exceptUsages) if (e == uid) { skip = true; break; }
-            if (!skip) cur[ncur++] = uid;
-        }
-    }
+    const keysidekick::ReportEdges edges = keysidekick::ComputeReportEdges(g_prevReport, report, len);
 
-    // KEYUP: usage, которые были в prev, но нет в cur
-    for (int k = 0; k < 6; k++) {
-        int uid = g_prevReport[k];
-        if (uid == 0) continue;
-        bool stillHeld = false;
-        for (int j = 0; j < ncur; j++) if (cur[j] == uid) { stillHeld = true; break; }
-        if (!stillHeld) {
-            ScanInfo si = UsageToSet1(uid);
-            if (si.scan) SendOneScan(si.scan, si.extended, true);
-        }
+    // KEYUP: usage, которые были в prev, но нет в текущем отчёте.
+    for (std::size_t i = 0; i < edges.released.size(); ++i) {
+        const int uid = edges.released[i];
+        if (keysidekick::ReportEdgeConsumed(uid, exceptUsages)) continue;   // никогда не инжектилась
+        ScanInfo si = UsageToSet1(uid);
+        if (si.scan) SendOneScan(si.scan, si.extended, true);
     }
-    // KEYDOWN: usage, которые есть в cur, но не было в prev
-    for (int j = 0; j < ncur; j++) {
-        int uid = cur[j];
-        bool wasHeld = false;
-        for (int k = 0; k < 6; k++) if (g_prevReport[k] == uid) { wasHeld = true; break; }
-        if (!wasHeld) {
-            ScanInfo si = UsageToSet1(uid);
-            if (si.scan) SendOneScan(si.scan, si.extended, false);
-        }
+    // KEYDOWN: новые usage, кроме consumed (они уходят в action).
+    for (std::size_t i = 0; i < edges.pressed.size(); ++i) {
+        const int uid = edges.pressed[i];
+        if (keysidekick::ReportEdgeConsumed(uid, exceptUsages)) continue;
+        ScanInfo si = UsageToSet1(uid);
+        if (si.scan) SendOneScan(si.scan, si.extended, false);
     }
-    // обновить prev (только неотфильтрованные usage)
-    for (int k = 0; k < 6; k++) g_prevReport[k] = (k < ncur) ? cur[k] : 0;
+    // Обновить prev (учитывая и consumed-клавиши).
+    keysidekick::StoreHeldUsages(edges.held, g_prevReport);
 }
 
 // =====================================================================
@@ -1222,6 +1229,7 @@ static bool ExecuteAction(const std::string& action, int usageId) {
         Log("Toggle → %s (usage 0x%02X)", newName.c_str(), usageId);
         if (newName != oldName) OnProfileSwitched(oldName, newName);
         UpdateTray();
+        BumpRevision();   // как и !switch: иначе SSE-клиенты не увидят смену
         return true;
     }
     if (action.rfind("!launch:", 0) == 0) {
@@ -2044,8 +2052,9 @@ static void ScheduleTargetedRepeatTimer() {
 
 static void DispatchTargetedRepeats() {
     const std::uint64_t now = GetTickCount64();
-    const std::vector<keysidekick::TargetedKey> due =
-        g_targetedKeys.dueRepeats(now);
+    EnterCriticalSection(&g_csLedger);
+    const std::vector<keysidekick::TargetedKey> due = g_targetedKeys.dueRepeats(now);
+    LeaveCriticalSection(&g_csLedger);
     for (std::vector<keysidekick::TargetedKey>::const_iterator held = due.begin();
          held != due.end(); ++held) {
         HWND target = reinterpret_cast<HWND>(held->target);
@@ -2053,7 +2062,9 @@ static void DispatchTargetedRepeats() {
                           keysidekick::TargetedMessageState::RepeatDown)) {
             continue;
         }
+        EnterCriticalSection(&g_csLedger);
         g_targetedKeys.recordUp(held->usageId, NULL);
+        LeaveCriticalSection(&g_csLedger);
         Log("Targeted repeat stopped: target unavailable for usage 0x%02X",
             held->usageId);
     }
@@ -2062,7 +2073,10 @@ static void DispatchTargetedRepeats() {
 
 static void ReleaseTargetedUsage(int usageId) {
     keysidekick::TargetedKey held = {0, 0, 0, 0, false, 0, 0};
-    if (!g_targetedKeys.recordUp(usageId, &held)) return;
+    EnterCriticalSection(&g_csLedger);
+    const bool known = g_targetedKeys.recordUp(usageId, &held);
+    LeaveCriticalSection(&g_csLedger);
+    if (!known) return;
 
     HWND target = reinterpret_cast<HWND>(held.target);
     if (!PostWindowKey(target, WindowKeyFromHeld(held),
@@ -2074,7 +2088,9 @@ static void ReleaseTargetedUsage(int usageId) {
 
 static void ReleaseAllTargetedKeys() {
     if (g_hMsgWindow) KillTimer(g_hMsgWindow, TARGETED_REPEAT_TIMER_ID);
+    EnterCriticalSection(&g_csLedger);
     const std::vector<keysidekick::TargetedKey> held = g_targetedKeys.releaseAll();
+    LeaveCriticalSection(&g_csLedger);
     for (std::vector<keysidekick::TargetedKey>::const_iterator key = held.begin();
          key != held.end(); ++key) {
         HWND target = reinterpret_cast<HWND>(key->target);
@@ -2089,18 +2105,22 @@ static bool SendHoldableKeyToTarget(const Profile& prof,
                                     const std::string& action) {
     WindowKey single;
     if (!ParseSingleKey(action, single)) return false;   // не одиночная клавиша → fall through к SendToTargetWindow (комбо/последовательность)
-    if (g_targetedKeys.owns(usageId)) return true;
+    EnterCriticalSection(&g_csLedger);
+    const bool alreadyHeld = g_targetedKeys.owns(usageId);
+    LeaveCriticalSection(&g_csLedger);
+    if (alreadyHeld) return true;
 
     HWND target = FindProfileTarget(prof);
     if (!target) {
-        HandleMissingProfileTarget(prof);
-        return true;
+        // Возвращаем false: вызывающий сделает fallback (SendToTargetWindow),
+        // который при отсутствии окна один раз выполнит AutoStart-запуск.
+        return false;
     }
     if (!PostWindowKey(target, single,
                        keysidekick::TargetedMessageState::InitialDown)) {
         Log("Targeted key-down failed for %s usage 0x%02X",
             prof.name.c_str(), usageId);
-        return true;
+        return false;   // даём шанс fallback-пути вместо тихой потери нажатия
     }
 
     keysidekick::TargetedKey held = {
@@ -2112,7 +2132,10 @@ static bool SendHoldableKeyToTarget(const Profile& prof,
         GetTickCount64() + g_targetedRepeatDelayMs,
         g_targetedRepeatIntervalMs
     };
-    if (!g_targetedKeys.recordDown(held)) {
+    EnterCriticalSection(&g_csLedger);
+    const bool recorded = g_targetedKeys.recordDown(held);
+    LeaveCriticalSection(&g_csLedger);
+    if (!recorded) {
         PostWindowKey(target, single, keysidekick::TargetedMessageState::KeyUp);
         return true;
     }
@@ -2183,6 +2206,7 @@ static void AutoSwitchOnForegroundChange() {
         procUtf8.resize(wlen);
         WideCharToMultiByte(CP_UTF8, 0, procName.c_str(), (int)procName.size(), &procUtf8[0], wlen, NULL, NULL);
     }
+    if (procUtf8.empty()) return;   // процесс не читается — не подменяем профиль вслепую
     if (procUtf8 == g_lastAutoSwitchCheck) return;
     g_lastAutoSwitchCheck = procUtf8;
     // Find a targeted profile with target_exe matching this process
@@ -2286,7 +2310,7 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // Второй инстанс попросил открыть дашборд (app_instance → FindWindowW
         // по классу окна → точечное сообщение вместо HWND_BROADCAST).
         char url[64];
-        snprintf(url, sizeof(url), "http://127.0.0.1:%d/", g_httpPort);
+        snprintf(url, sizeof(url), "http://127.0.0.1:%d/", LiveHttpPort());
         ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
         return 0;
     }
@@ -2294,7 +2318,7 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // Phase 6: left-click → open dashboard, right-click → context menu
         if (lp == WM_LBUTTONUP) {
             char url[64];
-            snprintf(url, sizeof(url), "http://127.0.0.1:%d/", g_httpPort);
+            snprintf(url, sizeof(url), "http://127.0.0.1:%d/", LiveHttpPort());
             ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
         } else if (lp == WM_RBUTTONUP) {
             POINT pt; GetCursorPos(&pt);
@@ -2360,18 +2384,44 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 break;
             }
             case DASH_SET_PROFILE: {
-                // не позволяем ломать built-in basic
-                Profile& p = g_profiles[op->profile];
-                p.name = op->profile;
-                if (op->profile != std::string("basic")) {
-                    p.mode = (op->mode == 0) ? MODE_BASIC : MODE_TARGETED;
-                    p.targetClass = op->targetClass;
-                    p.targetExe = op->targetExe;
-                    p.targetPath = op->targetPath;
-                    p.autoStart = op->autoStart != 0;
-                    p.layerModName = op->layerMod;
-                    p.layerModMask = ModifierNameToMask(p.layerModName);
+                // Новый профиль создаём через domain (ProfileService): раньше
+                // здесь стоял operator[] — запись появлялась только в runtime-
+                // проекции g_profiles и стиралась первой же ProjectDomainToRuntime().
+                const std::string requested = op->profile;
+                if (requested.empty()) { snprintf(op->error, sizeof(op->error), "missing profile name"); break; }
+                if (requested == "basic") {
+                    snprintf(op->error, sizeof(op->error), "'basic' is the built-in profile and cannot be edited here");
+                    break;
                 }
+                if (g_profiles.find(requested) == g_profiles.end()) {
+                    std::string newId = requested;
+                    for (char& c : newId) {
+                        if (!(std::isalnum((unsigned char)c) || c == '-' || c == '_')) c = '_';
+                    }
+                    try {
+                        keysidekick::ProfileService svc(g_domain);
+                        svc.createProfile(newId, requested,
+                            (op->mode == 0) ? keysidekick::ProfileMode::Normal
+                                            : keysidekick::ProfileMode::Targeted);
+                        ProjectDomainToRuntime();
+                    } catch (const std::exception& e) {
+                        snprintf(op->error, sizeof(op->error), "%s", e.what());
+                        break;
+                    }
+                    if (g_profiles.find(requested) == g_profiles.end()) {
+                        snprintf(op->error, sizeof(op->error), "profile could not be created");
+                        break;
+                    }
+                }
+                Profile& p = g_profiles[requested];
+                p.name = requested;
+                p.mode = (op->mode == 0) ? MODE_BASIC : MODE_TARGETED;
+                p.targetClass = op->targetClass;
+                p.targetExe = op->targetExe;
+                p.targetPath = op->targetPath;
+                p.autoStart = op->autoStart != 0;
+                p.layerModName = op->layerMod;
+                p.layerModMask = ModifierNameToMask(p.layerModName);
                 op->success = true;
                 break;
             }
@@ -2707,11 +2757,16 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             default:
                 snprintf(op->error, sizeof(op->error), "unknown op");
         }
-        bool writeOk = true;
         if (op->success && op->op != DASH_RELOAD && !op->noPersist) {
             // WriteConfig вне локa (только main thread пишет файл)
             LeaveCriticalSection(&g_csProfile);
-            WriteConfig();
+            if (!WriteConfig()) {
+                // Провал записи не должен выглядеть как успех: иначе dashboard
+                // говорит «сохранено», а правка теряется при перезапуске.
+                op->success = false;
+                snprintf(op->error, sizeof(op->error),
+                         "config.ini could not be written — change not saved");
+            }
             if (op->needsReconnect) {
                 // C2: НЕ трогаем WinUSB с message-dispatch пути — там может
                 // висеть overlapped read (WinUsb_Free с pending I/O = UB).
@@ -2836,7 +2891,7 @@ static void ShowTrayMenu(HWND h, int x, int y) {
     } else if (cmd == 2) {
         // Open dashboard in default browser
         char url[64];
-        snprintf(url, sizeof(url), "http://127.0.0.1:%d/", g_httpPort);
+        snprintf(url, sizeof(url), "http://127.0.0.1:%d/", LiveHttpPort());
         ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
     } else if (cmd == 3) {
         // About box
@@ -2994,6 +3049,9 @@ static std::string B64Decode(const std::string& in) {
         if (bits >= 8) {
             bits -= 8;
             out += (char)((buf >> bits) & 0xFF);
+            // Оставляем только неиспользованные биты: иначе buf переполняет int
+            // на длинном вводе (UB) — значение читается верно только по случайности.
+            buf &= (1 << bits) - 1;
         }
     }
     return out;
@@ -3436,6 +3494,7 @@ static DWORD WINAPI HttpThread(LPVOID) {
     }
     if (listen(srv, 5) == SOCKET_ERROR) { Log("HTTP listen failed"); closesocket(srv); return 1; }
     Log("HTTP listening on 127.0.0.1:%d", g_httpPort);
+    g_httpPortBound = g_httpPort;   // живой порт для policy/URL/диагностики
     while (g_httpRunning) {
 
         // H3: select-timeout accept — быстрый выход при остановке (join на exit).
@@ -3617,7 +3676,7 @@ static void HandleHttpConnection(SOCKET cli) {
         // Голый Host (без порта) legacy-сервер терпел; нормализуем, чтобы
         // строгий loopback-check в pipeline его тоже принял.
         if (meta.host.find(':') == std::string::npos)
-            meta.host += ":" + std::to_string(g_httpPort);
+            meta.host += ":" + std::to_string(LiveHttpPort());
         meta.origin = originHeader;
         meta.sec_fetch_site = secFetchSiteHeader;
         meta.content_type = contentTypeHeader;
@@ -3627,7 +3686,7 @@ static void HandleHttpConnection(SOCKET cli) {
         meta.body_bytes = body.size();
 
         keysidekick::SecurityPolicy policy;
-        policy.port = (unsigned short)g_httpPort;
+        policy.port = (unsigned short)LiveHttpPort();
         policy.allow_ipv6_loopback = false;
         policy.token_header_name = "X-KeySidekick-Token";
         policy.token = g_csrfToken;
@@ -3738,21 +3797,8 @@ static void HandleHttpConnection(SOCKET cli) {
         std::string wrap = "{\"active\":\"" + JsonEscape(active) + "\",\"profiles\":" + j + "}";
         HttpSendJson(cli, wrap);
     }
-    // GET /api/profile?name=X
-    else if (method == "GET" && path == "/api/profile") {
-        std::string name;
-        if (const char* p = strstr(query.c_str(), "name=")) {
-            name = p+5; size_t a = name.find('&'); if (a != std::string::npos) name = name.substr(0,a);
-        }
-        if (name.empty()) { HttpSendJson(cli, "{\"error\":\"missing name\"}", 400); }
-        else {
-            EnterCriticalSection(&g_csProfile);
-            auto it = g_profiles.find(name);
-            std::string j = (it != g_profiles.end()) ? ProfileToJson(it->second) : "{\"error\":\"not found\"}";
-            LeaveCriticalSection(&g_csProfile);
-            HttpSendJson(cli, j, (it != g_profiles.end()) ? 200 : 404);
-        }
-    }
+    // GET /api/profile?name=X — удалён как мёртвый: путь /api/profile
+    // отклоняется как mutating-GET (405) в policy ещё до роутинга.
     // POST /api/profile/activate  body {"name":"X"}
     // (C1: legacy GET /switch и GET /profile удалены — они мутировали state
     //  без token/origin и теперь возвращают 405 выше по коду.)
@@ -4200,11 +4246,15 @@ static void HandleHttpConnection(SOCKET cli) {
             app.processName = processName;
             LeaveCriticalSection(&g_csProfile);
 
-            WriteConfig();
-            BumpRevision();
-
-            std::string resp = "{\"ok\":true,\"id\":\"" + JsonEscape(appId) + "\"}";
-            HttpSendJson(cli, resp);
+            // Пишем файл и сообщаем вызывающему правду: раньше провал записи
+            // возвращал {"ok":true} и приложение исчезало после перезапуска.
+            if (!WriteConfig()) {
+                HttpSendJson(cli, "{\"error\":\"config.ini could not be written\"}", 500);
+            } else {
+                BumpRevision();
+                std::string resp = "{\"ok\":true,\"id\":\"" + JsonEscape(appId) + "\"}";
+                HttpSendJson(cli, resp);
+            }
         }
     }
     // GET /api/v1/presets — каталог AI-agent панелей
@@ -4250,14 +4300,30 @@ static void HandleHttpConnection(SOCKET cli) {
         JsonGetStr(body, "config", b64);
         std::string cfg = B64Decode(b64);
         if (cfg.empty()) { HttpSendJson(cli, "{\"error\":\"missing or empty config\"}", 400); }
+        else if (!keysidekick::config::Parse(cfg).ok()) {
+            // Импорт не должен принимать файл, который потом не прочитается:
+            // раньше валидатор всегда возвращал true и битый конфиг затирал рабочий.
+            HttpSendJson(cli, "{\"error\":\"imported config is not a valid KeySidekick config\"}", 400);
+        }
         else {
             std::wstring wpath;
             int wlen = MultiByteToWideChar(CP_ACP, 0, CONFIG_FILE, -1, NULL, 0);
             wpath.resize(wlen);
             MultiByteToWideChar(CP_ACP, 0, CONFIG_FILE, -1, &wpath[0], wlen);
             if (!wpath.empty() && wpath.back() == 0) wpath.pop_back();
-            keysidekick::StorageResult r = keysidekick::AtomicWriteUtf8(
-                wpath, cfg, [](const std::string&, std::string*) { return true; });
+            keysidekick::StorageResult r;
+            {
+                // Тот же лок, что и у WriteConfig: два писателя одного файла
+                // (main thread и этот воркер) не должны пересекаться. Лок
+                // отпускаем ДО RunDashOp — иначе дедлок с main thread.
+                EnterCriticalSection(&g_csProfile);
+                r = keysidekick::AtomicWriteUtf8(
+                    wpath, cfg, [](const std::string& c, std::string* reason) -> bool {
+                        if (c.empty()) { if (reason) *reason = "config is empty"; return false; }
+                        return keysidekick::config::Parse(c).ok();
+                    });
+                LeaveCriticalSection(&g_csProfile);
+            }
             if (!r.ok()) {
                 HttpSendJson(cli, "{\"error\":\"write failed\"}", 500);
             } else {
@@ -4354,7 +4420,7 @@ static void HandleHttpConnection(SOCKET cli) {
         // Access-Control-Allow-Origin не выводится вовсе (никогда не "*").
         std::string sseOrigin;
         if (!originHeader.empty() &&
-            keysidekick::IsAllowedOrigin(originHeader, (unsigned short)g_httpPort, false)) {
+            keysidekick::IsAllowedOrigin(originHeader, (unsigned short)LiveHttpPort(), false)) {
             sseOrigin = originHeader;
         }
         SseClientStart* start = new SseClientStart();
@@ -4367,7 +4433,7 @@ static void HandleHttpConnection(SOCKET cli) {
             delete start;
             closesocket(cli);
         }
-        return;  // skip the closesocket at the end
+        return;  // сокет передан SseClientThread — закрытие на его стороне
     }
     // ---- Phase 6: Startup management ----
     // GET /api/v1/startup — check if auto-start is configured
@@ -4404,10 +4470,14 @@ static void HandleHttpConnection(SOCKET cli) {
             DWORD exeLen = GetModuleFileNameW(NULL, exePath, MAX_PATH);
             bool created = false;
             if (exeLen > 0 && exeLen < MAX_PATH) {
-                HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-                if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
+                const HRESULT comInit = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+                // Учёт CoInitializeEx ведём ОТДЕЛЬНОЙ переменной: раньше здесь
+                // переиспользовался hr, и CoUninitialize() вызывался по
+                // результату последнего COM-вызова (дисбаланс ссылок COM).
+                const bool comOwned = SUCCEEDED(comInit);
+                if (comOwned || comInit == RPC_E_CHANGED_MODE) {
                     IShellLinkW* pShellLink = NULL;
-                    hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (LPVOID*)&pShellLink);
+                    HRESULT hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (LPVOID*)&pShellLink);
                     if (SUCCEEDED(hr) && pShellLink) {
                         pShellLink->SetPath(exePath);
                         // Working directory = exe folder
@@ -4427,8 +4497,8 @@ static void HandleHttpConnection(SOCKET cli) {
                         }
                         pShellLink->Release();
                     }
-                    // Only uninitialize if we initialized (not RPC_E_CHANGED_MODE)
-                    if (SUCCEEDED(hr)) CoUninitialize();
+                    // Только если инициализировали сами (RPC_E_CHANGED_MODE — чужая квартира)
+                    if (comOwned) CoUninitialize();
                 }
             }
             if (created) {
@@ -4606,8 +4676,9 @@ static void HandleHttpConnection(SOCKET cli) {
                         // Immediate data — device is actively sending
                         if (!firstDet) j += ",";
                         firstDet = false;
-                        char shortPath[256];
+                        char shortPath[256] = {0};
                         strncpy(shortPath, det->DevicePath, sizeof(shortPath)-1);
+                        shortPath[sizeof(shortPath)-1] = 0;   // strncpy не терминирует при усечении
                         j += "{\"path\":\"" + JsonEscape(shortPath) + "\",\"detected\":true}";
                     } else if (GetLastError() == ERROR_IO_PENDING) {
                         DWORD wr = WaitForSingleObject(ov.hEvent, 500);
@@ -4615,8 +4686,9 @@ static void HandleHttpConnection(SOCKET cli) {
                             if (WinUsb_GetOverlappedResult(wusb, &ov, &got, FALSE) && got > 0) {
                                 if (!firstDet) j += ",";
                                 firstDet = false;
-                                char shortPath[256];
+                                char shortPath[256] = {0};
                                 strncpy(shortPath, det->DevicePath, sizeof(shortPath)-1);
+                                shortPath[sizeof(shortPath)-1] = 0;   // усечение не терминируется strncpy
                                 j += "{\"path\":\"" + JsonEscape(shortPath) + "\",\"detected\":true}";
                             }
                         } else {
@@ -4735,7 +4807,12 @@ static void HandleHttpConnection(SOCKET cli) {
     // POST /api/v1/input/identify — сброс и старт окна прослушивания:
     // пользователь жмёт клавишу, GET отдаёт источник (VID/PID).
     else if (method == "POST" && path == "/api/v1/input/identify") {
-        // Окно прослушивания 15с: basic-режим глотает выделенную клавиатуру.
+        // Окно прослушивания 15с: basic-режим глотает выделенную клавиатуру
+        // (key-up'ы в этом окне не доходят до ProcessReport), поэтому перед
+        // входом снимаем всё, что мы уже инжектировали — иначе физически
+        // отпущенная клавиша осталась бы зажатой в системе.
+        ReleaseAllKeys();
+        ReleaseAllTargetedKeys();
         g_identifyListening.store(true);
         g_identifyStartTick.store(GetTickCount());
         EnterCriticalSection(&g_csIdentified);
@@ -4958,7 +5035,7 @@ static void HandleHttpConnection(SOCKET cli) {
         j += "}";
 
         // HTTP/API health
-        j += ",\"httpPort\":" + std::to_string(g_httpPort);
+        j += ",\"httpPort\":" + std::to_string(LiveHttpPort());
         j += ",\"httpEnabled\":" + std::string(g_httpEnabled ? "true" : "false");
         j += ",\"trayEnabled\":" + std::string(g_trayEnabled ? "true" : "false");
 
@@ -5144,8 +5221,8 @@ static void LoadConfigLegacy() {
         Trim(key); Trim(val);
 
         if (curSection == "General") {
-            if (_stricmp(key,"DeviceVIDPID")==0) { strncpy(g_deviceVidPid, val, sizeof(g_deviceVidPid)-1); }
-            else if (_stricmp(key,"DefaultProfile")==0) { strncpy(g_defaultProfile, val, sizeof(g_defaultProfile)-1); }
+            if (_stricmp(key,"DeviceVIDPID")==0) { strncpy(g_deviceVidPid, val, sizeof(g_deviceVidPid)-1); g_deviceVidPid[sizeof(g_deviceVidPid)-1] = 0; }
+            else if (_stricmp(key,"DefaultProfile")==0) { strncpy(g_defaultProfile, val, sizeof(g_defaultProfile)-1); g_defaultProfile[sizeof(g_defaultProfile)-1] = 0; }
             else if (_stricmp(key,"HTTPPort")==0) { g_httpPort = atoi(val); }
             else if (_stricmp(key,"HTTPEnabled")==0) { g_httpEnabled = atoi(val)!=0; }
             else if (_stricmp(key,"TrayEnabled")==0) { g_trayEnabled = atoi(val)!=0; }
@@ -5218,8 +5295,13 @@ static void ApplyGeneralSettings(const keysidekick::config::GeneralSettings& gs)
         strncpy(g_defaultProfile, "basic", sizeof(g_defaultProfile)-1);
  g_defaultProfile[sizeof(g_defaultProfile)-1] = 0;
     }
-    g_httpPort = gs.http_port;
-    g_httpEnabled = gs.http_enabled;
+    // Listener уже слушает — HTTPPort/HTTPEnabled применяются только при старте:
+    // смена порта в рантайме лишь рассорила бы policy (новый порт) с сокетом
+    // (старый порт), и каждое соединение получало бы 403.
+    if (!g_httpRunning) {
+        g_httpPort = gs.http_port;
+        g_httpEnabled = gs.http_enabled;
+    }
     g_trayEnabled = gs.tray_enabled;
     g_logEnabled = gs.enable_log;
 }
@@ -5240,6 +5322,9 @@ static void LoadConfig() {
     keysidekick::StorageResult readResult = keysidekick::ReadUtf8File(wpath, &fileContent);
     if (!readResult.ok()) {
         Log("LoadConfig: cannot read %s (%s) — using defaults", CONFIG_FILE, readResult.message.c_str());
+        // Domain обязан соответствовать runtime: иначе следующий WriteConfig
+        // (SyncRuntimeToDomain) воскресит старый набор профилей поверх файла.
+        g_domain = keysidekick::DomainModel();
         EnsureBuiltinBasic();
         return;
     }
@@ -5255,11 +5340,13 @@ static void LoadConfig() {
                 Log("  ERROR: %s", pr.diagnostics[i].message.c_str());
             }
         }
+        // Legacy-парсер наполняет только g_profiles; g_domain чистим, чтобы
+        // проекция и запись не смешивали два разных набора профилей.
+        g_domain = keysidekick::DomainModel();
         EnsureBuiltinBasic();
         LoadConfigLegacy();
         return;
     }
-
     // Логировать warnings (миграция и т.д.)
     for (std::size_t i = 0; i < pr.diagnostics.size(); ++i) {
         if (pr.diagnostics[i].severity == keysidekick::config::DIAGNOSTIC_WARNING) {
@@ -5341,7 +5428,7 @@ static std::string BuildConfigContent() {
     char line[512];
     snprintf(line, sizeof(line), "DeviceVIDPID=%s\n", g_deviceVidPid); s += line;
     snprintf(line, sizeof(line), "DefaultProfile=%s\n", g_defaultProfile); s += line;
-    snprintf(line, sizeof(line), "HTTPPort=%d\n", g_httpPort); s += line;
+    snprintf(line, sizeof(line), "HTTPPort=%d\n", g_configGeneral.http_port); s += line;
     snprintf(line, sizeof(line), "HTTPEnabled=%d\n", g_httpEnabled ? 1 : 0); s += line;
     snprintf(line, sizeof(line), "TrayEnabled=%d\n", g_trayEnabled ? 1 : 0); s += line;
     snprintf(line, sizeof(line), "EnableLog=%d\n\n", g_logEnabled ? 1 : 0); s += line;
@@ -5385,10 +5472,11 @@ static std::string BuildConfigContent() {
 //  Обновляет: mappings, target fields (из default app), mode, isBuiltIn.
 // =====================================================================
 static void SyncRuntimeToDomain() {
-    // Обновить g_configGeneral из globals (HTTP/tray/etc могли измениться)
+    // Обновить g_configGeneral из globals (HTTP/tray/etc могли измениться).
+    // HTTPPort/HTTPEnabled НЕ переносим: listener биндится один раз, и значение
+    // из файла (в т.ч. импортированное) — единственный источник правды для
+    // следующего запуска; рантайм-порт живёт в g_httpPortBound.
     g_configGeneral.device_vid_pid = g_deviceVidPid;
-    g_configGeneral.http_port = g_httpPort;
-    g_configGeneral.http_enabled = g_httpEnabled;
     g_configGeneral.tray_enabled = g_trayEnabled;
     g_configGeneral.enable_log = g_logEnabled;
     g_configGeneral.default_profile_id = g_activeProfile;
@@ -5418,6 +5506,17 @@ static void SyncRuntimeToDomain() {
             // Убедиться что id безопасен для config_v3 (alnum/-/_)
             for (char& c : newId) {
                 if (!(std::isalnum((unsigned char)c) || c == '-' || c == '_')) c = '_';
+            }
+            // Санитайз может склеить два разных runtime-имени в один id
+            // ("My.Profile"/"My_Profile"): дубликат id ломает Serialize
+            // (ValidateForSerialization → ERROR → legacy fallback).
+            if (g_domain.findProfile(newId)) {
+                const std::string base = newId;
+                for (int suffix = 2; g_domain.findProfile(newId); ++suffix) {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "%d", suffix);
+                    newId = base + "-" + buf;
+                }
             }
             g_domain.profiles.push_back(
                 keysidekick::Profile(newId, runtimeName,
@@ -5660,7 +5759,10 @@ static void ReleaseAllKeys() {
         {0x5C, true,  VK_RWIN},
     };
 
-    std::vector<keysidekick::ScanKey> owned = g_injectedKeys.ownedKeysForRelease();
+    std::vector<keysidekick::ScanKey> owned;
+    EnterCriticalSection(&g_csLedger);
+    owned = g_injectedKeys.ownedKeysForRelease();
+    LeaveCriticalSection(&g_csLedger);
     int released = 0;
     for (const auto& k : owned) {
         unsigned short vk = 0;
@@ -5674,7 +5776,9 @@ static void ReleaseAllKeys() {
         in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
         if (k.extended) in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
         SendInput(1, &in, sizeof(INPUT));
+        EnterCriticalSection(&g_csLedger);
         g_injectedKeys.recordUp(k);
+        LeaveCriticalSection(&g_csLedger);
         released++;
     }
     if (released > 0) Log("Released %d injected keys (ownership-based)", released);
@@ -5919,6 +6023,7 @@ int main(int argc, char* argv[]) {
     InitializeCriticalSection(&g_csActivity);
     InitializeCriticalSection(&g_csDevInfo);
     InitializeCriticalSection(&g_csLog);
+    InitializeCriticalSection(&g_csLedger);
     g_csLogReady = true;
     // C2: событие, через которое DashOp-активация просит ReadLoop переподключить
     // устройство (создаётся до StartHttp — DashOp не может прийти раньше).
@@ -5956,7 +6061,7 @@ int main(int argc, char* argv[]) {
         if (!FindDevicePath(path)) {
             if (!deviceAbsentLogged) {
                 Log("Device not found, waiting...");
-                printf("Device not found. Dashboard at http://localhost:%d/ — waiting for device...\n", g_httpPort);
+                printf("Device not found. Dashboard at http://localhost:%d/ — waiting for device...\n", LiveHttpPort());
                 deviceAbsentLogged = true;
             }
             // Port-change детект: настроенный VID/PID виден как ОБЫЧНАЯ клавиатура —

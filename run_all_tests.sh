@@ -44,6 +44,7 @@ echo ""
 
 echo "--- Core modules ---"
 run_test input_ledger        "tests/input_ledger_tests.cpp src/input_ledger.cpp"
+run_test report_diff         "tests/report_diff_tests.cpp"
 run_test http_security       "tests/http_security_tests.cpp src/http_security.cpp"        "-lbcrypt"
 run_test domain_model        "tests/domain_model_tests.cpp src/domain_model.cpp"
 run_test config_v3           "tests/config_v3_tests.cpp src/config_v3.cpp"                ""  "-O0"
