@@ -191,16 +191,40 @@ public:
     thread() : handle_(NULL), id_(0) {}
     template <typename F>
     explicit thread(F f) : handle_(NULL), id_(0) {
-        f_ = new FuncHolder<F>(f);
-        handle_ = CreateThread(NULL, 0, &thread::ThreadProc, f_, 0, &id_);
-        if (!handle_) { delete f_; f_ = NULL; }
+        FuncBase* fb = new FuncHolder<F>(f);
+        handle_ = CreateThread(NULL, 0, &thread::ThreadProc, fb, 0, &id_);
+        if (!handle_) { delete fb; }
     }
     ~thread() { if (handle_) CloseHandle(handle_); }
+
+    // std::thread — move-only. Без этого компилятор генерировал копирование
+    // HANDLE/FuncBase: временный объект (например, при push_back в вектор)
+    // закрывал хендл в своём деструкторе, а оставшаяся копия потом ждала
+    // ЗАКРЫТЫЙ хендл — join() возвращался мгновенно, не дожидаясь потока
+    // (измерено: 16 потоков инкремента счётчика → 0..9 после join()).
+    thread(thread&& other) : handle_(other.handle_), id_(other.id_) {
+        other.handle_ = NULL;
+        other.id_ = 0;
+    }
+    thread& operator=(thread&& other) {
+        if (this != &other) {
+            if (handle_) CloseHandle(handle_);
+            handle_ = other.handle_;
+            id_ = other.id_;
+            other.handle_ = NULL;
+            other.id_ = 0;
+        }
+        return *this;
+    }
+
     void join() {
         if (handle_) { WaitForSingleObject(handle_, INFINITE); CloseHandle(handle_); handle_ = NULL; }
     }
     bool joinable() const { return handle_ != NULL; }
 private:
+    thread(const thread&);
+    thread& operator=(const thread&);
+
     struct FuncBase { virtual ~FuncBase() {} virtual void call() = 0; };
     template <typename F>
     struct FuncHolder : FuncBase { F f; FuncHolder(F func) : f(func) {} void call() { f(); } };
@@ -210,7 +234,6 @@ private:
         delete fb;
         return 0;
     }
-    FuncBase* f_;
     HANDLE handle_;
     DWORD id_;
 };

@@ -2043,7 +2043,12 @@ static void ScheduleTargetedRepeatTimer() {
     KillTimer(g_hMsgWindow, TARGETED_REPEAT_TIMER_ID);
 
     std::uint64_t deadline = 0;
-    if (!g_targetedKeys.nextRepeatAt(&deadline)) return;
+    // nextRepeatAt читает тот же вектор, который HTTP-воркеры очищают через
+    // ReleaseAllTargetedKeys (/devices/detect|capture) — только под g_csLedger.
+    EnterCriticalSection(&g_csLedger);
+    const bool hasRepeat = g_targetedKeys.nextRepeatAt(&deadline);
+    LeaveCriticalSection(&g_csLedger);
+    if (!hasRepeat) return;
 
     const std::uint64_t now = GetTickCount64();
     const std::uint64_t remaining = deadline > now ? deadline - now : 1;

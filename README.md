@@ -220,7 +220,7 @@ cd src
 build.bat
 ```
 
-`src\build.bat` performs the full build: it regenerates the embedded web dashboard from `web/` via `web/generate_dashboard.ps1`, compiles the icon resources with `windres` (`resources.rc` → `resources.o`), then links `sidekick.exe` (all 11 C++ sources + `resources.o`, WinUSB/SetupAPI/user32/ws2_32/… libs) and `probe_device.exe`. It looks for `C:\MinGW64\bin\g++.exe` first and falls back to `g++` from your PATH — either works as long as MinGW-w64 g++ is reachable.
+`src\build.bat` performs the full build: it regenerates the embedded web dashboard from `web/` via `web/generate_dashboard.ps1`, compiles the icon resources with `windres` (`resources.rc` → `resources.o`), then links `sidekick.exe` (all 11 C++ sources + `resources.o`, WinUSB/SetupAPI/user32/ws2_32/… libs) and `probe_device.exe`. It uses `g++`/`windres` from your PATH first and falls back to `C:\MinGW64\bin` — either works as long as MinGW-w64 g++ is reachable.
 
 `probe_device.exe` is a diagnostic tool — run it after the Zadig swap to dump the device's interface GUID, endpoints, and HID report descriptor (confirms the standard 8-byte keyboard report).
 
