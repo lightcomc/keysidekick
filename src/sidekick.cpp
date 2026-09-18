@@ -5019,6 +5019,12 @@ static void HandleHttpConnection(SOCKET cli) {
     else {
         HttpSend(cli, "not found", "text/plain", 404);
     }
+
+    // Every response above is written with "Connection: close", and this worker
+    // owns the accepted socket for exactly one request: close it here.
+    // (The /api/v1/events branch hands the socket to SseClientThread and returns
+    // before this point, so it is never closed twice.)
+    closesocket(cli);
 }
 
 static DWORD WINAPI HttpWorkerThread(LPVOID parameter) {
