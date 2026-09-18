@@ -193,14 +193,29 @@ bool IsMutationMethod(const std::string& method) {
            normalized == "PATCH" || normalized == "DELETE";
 }
 
+// Единственный источник правды о «мутирующих» путях: раньше тот же список жил
+// вторым экземпляром в sidekick.cpp (IsPostOnlyPath) и уже разошёлся — из-за
+// чего GET /api/v1/devices/detect (сброс клавиш + пробирование устройств) шёл
+// без токена. Список обязан покрывать все пути, меняющие состояние.
 bool IsMutationPath(const std::string& path) {
     const std::string normalized = StripQueryAndFragment(path);
-    return normalized == "/api/profile/activate" ||
-           normalized == "/api/profile" ||
-           normalized == "/api/key" ||
-           normalized == "/api/key/delete" ||
-           normalized == "/api/reload" ||
-           normalized == "/api/capture/start";
+    static const char* kMutationPaths[] = {
+        "/api/profile/activate", "/api/profile", "/api/key", "/api/key/delete",
+        "/api/key/update", "/api/key/move", "/api/key/duplicate", "/api/reload",
+        "/api/capture/start",
+        "/api/v1/profile/create", "/api/v1/profile/delete", "/api/v1/profile/rename",
+        "/api/v1/profile/duplicate", "/api/v1/profile/link-app", "/api/v1/profile/unlink-app",
+        "/api/v1/profile/set-default-app", "/api/v1/applications/create",
+        "/api/v1/applications/test-resolve", "/api/v1/config/import",
+        "/api/v1/preset/apply", "/api/v1/devices/activate", "/api/v1/devices/detect",
+        "/api/v1/devices/capture", "/api/v1/action/fire",
+        "/api/v1/windows/foreground/pick", "/api/v1/driver/swap",
+        "/api/v1/driver/restore"
+    };
+    for (std::size_t i = 0; i < sizeof(kMutationPaths) / sizeof(kMutationPaths[0]); ++i) {
+        if (normalized == kMutationPaths[i]) return true;
+    }
+    return false;
 }
 
 bool IsJsonContentType(const std::string& content_type) {

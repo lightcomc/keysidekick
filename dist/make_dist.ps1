@@ -79,6 +79,10 @@ if ($stale) {
 # собран бинарник, рядом с ним.
 $sourceFiles = @()
 foreach ($f in (Get-ChildItem $SrcDir -File)) {
+    # src\config.ini — рабочий конфиг разработчика (его устройство, профили,
+    # пути к приложениям). В релиз он попадать не должен: в zip лежит
+    # config.example.ini. Раньше сюда попадали ВСЕ *.ini из src/.
+    if ($f.Name -eq 'config.ini') { continue }
     if ($f.Extension -in '.cpp', '.h', '.rc', '.bat', '.ini') {
         $sourceFiles += @{ Src = $f.FullName; Rel = "source\src\$($f.Name)" }
     }

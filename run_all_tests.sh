@@ -28,12 +28,14 @@ run_test() {
         return
     fi
 
-    # Run
-    if "$OBJDIR/${name}.exe" >/dev/null 2>&1; then
+    # Run. On failure, surface the test's own output: the suites print the
+    # failing expression, and throwing it away left red builds with no cause.
+    if "$OBJDIR/${name}.exe" >"$OBJDIR/${name}.run.log" 2>&1; then
         echo "  ✓ $name"
         passed=$((passed+1))
     else
         echo "  ✗ $name (runtime)"
+        sed 's/^/      /' "$OBJDIR/${name}.run.log" | tail -20
         failed=$((failed+1))
         failed_names+=("$name")
     fi

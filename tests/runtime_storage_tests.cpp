@@ -110,8 +110,12 @@ void WriteRaw(const std::wstring& path, const std::string& content) {
 }
 
 size_t CountTemporaryFiles(const std::wstring& directory) {
+    // Производственное имя временного файла — <base>.tmp_<hex>_<hex>_<hex><ext>
+    // (UniqueTempPath в runtime_storage.cpp). Прежний шаблон "*.tmp.*" не
+    // совпадал ни с одним таким именем (там ".tmp_", а не ".tmp."), поэтому все
+    // проверки «temp не остался» проходили, ничего не проверяя.
     WIN32_FIND_DATAW entry = {};
-    HANDLE find = FindFirstFileW(JoinPath(directory, L"*.tmp.*").c_str(), &entry);
+    HANDLE find = FindFirstFileW(JoinPath(directory, L"*.tmp_*").c_str(), &entry);
     if (find == INVALID_HANDLE_VALUE) return 0;
 
     size_t count = 1;
@@ -265,6 +269,23 @@ struct TestCase {
 
 }  // namespace
 
+void TestTemporaryFileDetectorSeesProductionNames() {
+    // Положительный контроль: helper обязан ВИДЕТЬ файл, названный по схеме
+    // UniqueTempPath, иначе шесть проверок «temp не остался» бессмысленны.
+    TemporaryDirectory temporary;
+    const std::wstring target = JoinPath(temporary.path(), L"config.ini");
+    WriteRaw(target, "content");
+    CHECK(CountTemporaryFiles(temporary.path()) == 0);
+
+    const std::wstring leftover =
+        JoinPath(temporary.path(), L"config.tmp_0000000000000001_00abcdef_2.ini");
+    WriteRaw(leftover, "partial");
+    CHECK(CountTemporaryFiles(temporary.path()) == 1);
+
+    CHECK(DeleteFileW(leftover.c_str()) != FALSE);
+    CHECK(CountTemporaryFiles(temporary.path()) == 0);
+}
+
 int main() {
     const std::vector<TestCase> tests = {
         {"runtime paths and directories", TestRuntimePathsAndDirectoriesUseExplicitRoots},
@@ -274,6 +295,7 @@ int main() {
         {"migration no-overwrite", TestMigrationDoesNotOverwriteDestination},
         {"Unicode directory", TestUnicodeDirectoryRoundTrip},
         {"temporary cleanup", TestRejectedMigrationCleansTemporaryFile},
+        {"temporary detector sees production names", TestTemporaryFileDetectorSeesProductionNames},
     };
 
     int failures = 0;

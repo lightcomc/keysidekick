@@ -201,7 +201,7 @@ h+='<section class="content-card"><div class="card-heading"><div><span class="st
 if(ib){h+='<div class="info-callout"><strong>Basic is the safe fallback.</strong><span>Unmapped keys behave like a normal foreground keyboard.</span></div>';}else{h+='<div id="targetSettings" '+(p.mode==='targeted'?'':'hidden')+'><div class="target-summary"><div><span class="eyebrow">Target application</span><strong id="targetSummaryText">'+esc(targetLabel)+'</strong><small>Keys keep going here even while another app is focused.</small></div><div><button type="button" class="btn" onclick="pickFromWindow()">Choose running window</button><button type="button" class="btn" onclick="pickForeground()">Pick foreground app</button><button type="button" class="btn" onclick="testResolve()">Test connection</button></div></div><details class="advanced"><summary>Advanced target settings</summary><div class="advanced-body"><div class="field-grid"><div class="field"><label for="fClass">Window class</label><input id="fClass" value="'+esc(p.targetClass)+'" placeholder="TAIMPMainForm" oninput="markProfileDirty()"></div><div class="field"><label for="fExe">Process name</label><input id="fExe" value="'+esc(p.targetExe)+'" placeholder="AIMP.exe" oninput="markProfileDirty()"></div></div><div class="field"><label for="fPath">Executable path</label><input id="fPath" value="'+esc(p.targetPath)+'" placeholder="C:\\\\...\\\\app.exe" oninput="markProfileDirty()"></div><label class="check-field"><input type="checkbox" id="fAuto" '+(p.autoStart?'checked':'')+' onchange="markProfileDirty()"> Start the app when its window is missing</label>';
 if(p.linkedApplications&&p.linkedApplications.length){h+='<div class="linked-apps"><span>Linked application IDs</span><div class="app-list">';for(const appId of p.linkedApplications){const isDefault=appId===p.defaultApplication;h+='<span class="app-badge'+(isDefault?' default':'')+'">'+esc(appId)+(isDefault?' ★':'')+'</span>';}h+='</div></div>';}
 h+='</div></details></div>';}h+='</section>';
-  if(p.isNew){h+='<div class="info-callout"><strong>Create the profile first.</strong><span>Then capture keys and add mappings.</span></div>';}else{h+='<section class="content-card"><div class="card-heading"><div><span class="step-number">2</span><div><h3>Key mappings</h3><p>What each physical key does in this profile.</p></div></div><span class="count-badge">'+p.keys.length+'</span></div><div class="mapping-list">';if(!p.keys.length)h+='<div class="mini-empty">No mappings yet. Add the first one below.</div>';for(const k of p.keys){const category=k.category||'key';const ambiguous=ambiguousKeyAction(k.action);h+='<article class="mapping-card'+(ambiguous?' has-warning':'')+'"><div class="mapping-trigger"><span class="key-badge">'+esc(keyName(k.usage))+'</span><small>'+(k.mod?'<span class="layer-badge">Fn · '+esc(modName(k.mod))+'</span>':'<span class="layer-badge plain">base</span>')+'</small></div><div class="mapping-action"><span class="category-badge cat-'+esc(category)+'">'+esc(category)+'</span><strong>'+esc(mappingDescription(p,k))+'</strong><code>'+esc(k.action)+'</code>'+(ambiguous?'<small class="mapping-warning">Use <code>'+esc(k.action.charAt(0).toLowerCase())+'</code> as the Action for reliable hold.</small>':'')+'</div><div class="mapping-btns"><button type="button" class="icon-btn" title="Move up" onclick="moveKeyUp('+k.usage+','+k.mod+')">↑</button><button type="button" class="icon-btn" title="Move down" onclick="moveKeyDown('+k.usage+','+k.mod+')">↓</button><button type="button" class="icon-btn" title="Edit action" onclick="editMapping('+k.usage+','+k.mod+',\''+esc(k.action).replace(/'/g,"\\'")+'\')">✎</button><button type="button" class="icon-btn danger" aria-label="Remove mapping for '+esc(keyName(k.usage))+'" onclick="delKey('+k.usage+','+k.mod+')">×</button></div></article>';}h+='</div></section>';
+  if(p.isNew){h+='<div class="info-callout"><strong>Create the profile first.</strong><span>Then capture keys and add mappings.</span></div>';}else{h+='<section class="content-card"><div class="card-heading"><div><span class="step-number">2</span><div><h3>Key mappings</h3><p>What each physical key does in this profile.</p></div></div><span class="count-badge">'+p.keys.length+'</span></div><div class="mapping-list">';if(!p.keys.length)h+='<div class="mini-empty">No mappings yet. Add the first one below.</div>';for(const k of p.keys){const category=k.category||'key';const ambiguous=ambiguousKeyAction(k.action);h+='<article class="mapping-card'+(ambiguous?' has-warning':'')+'"><div class="mapping-trigger"><span class="key-badge">'+esc(keyName(k.usage))+'</span><small>'+(k.mod?'<span class="layer-badge">Fn · '+esc(modName(k.mod))+'</span>':'<span class="layer-badge plain">base</span>')+'</small></div><div class="mapping-action"><span class="category-badge cat-'+esc(category)+'">'+esc(category)+'</span><strong>'+esc(mappingDescription(p,k))+'</strong><code>'+esc(k.action)+'</code>'+(ambiguous?'<small class="mapping-warning">Use <code>'+esc(k.action.charAt(0).toLowerCase())+'</code> as the Action for reliable hold.</small>':'')+'</div><div class="mapping-btns"><button type="button" class="icon-btn" title="Move up" onclick="moveKeyUp('+k.usage+','+k.mod+')">↑</button><button type="button" class="icon-btn" title="Move down" onclick="moveKeyDown('+k.usage+','+k.mod+')">↓</button><button type="button" class="icon-btn" title="Edit action" onclick="editMapping('+k.usage+','+k.mod+',\''+jsStr(k.action)+'\')">✎</button><button type="button" class="icon-btn danger" aria-label="Remove mapping for '+esc(keyName(k.usage))+'" onclick="delKey('+k.usage+','+k.mod+')">×</button></div></article>';}h+='</div></section>';
 h+='<section class="content-card mapping-builder"><div class="card-heading"><div><span class="step-number">3</span><div><h3>Add a mapping</h3><p>Press a key, choose an action, review, then add.</p></div></div></div><div class="builder-step"><div class="builder-label"><span>1</span><strong>Press a key</strong></div><div class="capture-row"><button type="button" class="btn primary" id="captureBtn" onclick="captureKey()">Capture from keyboard</button><span id="captureHint">or enter it manually</span></div><div class="field-grid compact"><div class="field"><label for="newKeyInput">Physical key</label><input id="newKeyInput" placeholder="q / f1 / space" oninput="delete this.dataset.usage;updateMappingPreview()"></div><div class="field"><label for="newMod">Fn layer / while holding</label><select id="newMod" onchange="updateMappingPreview()"><option value="0">base — no modifier</option><option value="51">Fn · Ctrl + Shift</option><option value="17">Fn · Ctrl</option><option value="34">Fn · Shift</option><option value="68">Fn · Alt</option><option value="85">Fn · Ctrl + Alt</option></select></div></div></div><div class="builder-step"><div class="builder-label"><span>2</span><strong>Choose what it does</strong></div>'+renderActionPicker()+'<details class="advanced manual-action"><summary>Advanced / enter action manually</summary><div class="advanced-body"><div class="field"><label for="newAction">Raw action</label><input id="newAction" placeholder="{F1} or !switch:basic" oninput="updateMappingPreview()"></div></div></details></div><div class="builder-step review-step"><div class="builder-label"><span>3</span><strong>Review and add</strong></div><div class="mapping-preview" id="mappingPreview">Choose a key → choose an action</div><button type="button" class="btn primary" onclick="addKey()">Add mapping</button></div></section>';}
 h+='<section class="content-card"><div class="card-heading"><div><span class="step-number">4</span><div><h3>Active keyboard — which pad this profile reads</h3><p>One keyboard is active. Change it in Keyboard Setup.</p></div></div></div><div id="activeKbdCard">Loading…</div><div style="margin-top:8px"><button type="button" class="btn" onclick="showDevices()">Open keyboard setup</button></div></section>';
 h+='<section class="content-card"><div class="card-heading"><div><span class="step-number">5</span><div><h3>Extras — tap to try</h3><p>Media, multi-app, combos, launch, profile switching — all from one keyboard.</p></div></div></div>'+featureGridHtml()+'</section>';
@@ -237,7 +237,12 @@ async function renderOnboarding(){
     }
   }catch(e){}
 }
-async function saveProfile(){if(!sel)return;const ib=sel.isBuiltin;const body={name:document.getElementById('fName').value,mode:document.getElementById('fMode').value,targetClass:ib?'':document.getElementById('fClass').value,targetExe:ib?'':document.getElementById('fExe').value,targetPath:ib?'':document.getElementById('fPath').value,autoStart:ib?false:document.getElementById('fAuto').checked,layerMod:ib?'':document.getElementById('fLayerMod').value};const r=await api('POST','/api/profile',body);if(r.ok){profileDirty=false;toast('Profile settings saved','success');await refresh();}else toast(r.error||'Save failed','error');}
+async function saveProfile(){if(!sel)return;const ib=sel.isBuiltin;const originalName=sel.name;const newName=document.getElementById('fName').value.trim();if(!newName){toast('Name required','error');return;}
+  // Имя в этом поле — тоже часть настроек, но переименование идёт отдельным
+  // роутом: раньше правка имени отправлялась в /api/profile и создавала ВТОРОЙ
+  // профиль (пользователь думал, что переименовал).
+  if(!ib&&newName!==originalName){const rn=await api('POST','/api/v1/profile/rename',{id:originalName,newName:newName});if(!rn.ok){toast(rn.error||'Rename failed','error');return;}selectedProfileName=newName;}
+  const body={name:newName,mode:document.getElementById('fMode').value,targetClass:ib?'':document.getElementById('fClass').value,targetExe:ib?'':document.getElementById('fExe').value,targetPath:ib?'':document.getElementById('fPath').value,autoStart:ib?false:document.getElementById('fAuto').checked,layerMod:ib?'':document.getElementById('fLayerMod').value};const r=await api('POST','/api/profile',body);if(r.ok){profileDirty=false;toast('Profile settings saved','success');await refresh();}else toast(r.error||'Save failed','error');}
 async function activate(){const name=sel.name;const r=await api('POST','/api/profile/activate',{name:name});if(r.ok){toast('Active profile: '+name,'success');await refresh();}else toast(r.error||'Activation failed','error');}
 async function delKey(u,m){const r=await api('POST','/api/key/delete',{profile:sel.name,usage:u,mod:m});if(r.ok){toast('Mapping removed','success');await refresh();}else toast(r.error||'Remove failed','error');}
 async function moveKeyUp(u,m){const r=await api('POST','/api/key/move',{profile:sel.name,usage:u,mod:m,direction:'up'});if(r.ok){await refresh();}else toast(r.error||'Move failed','error');}
@@ -618,7 +623,7 @@ async function showDevices(){
   if(st&&st.portChangeDetected){
     h+='<div class="info-callout warn" style="margin-bottom:14px"><strong>🔌 You changed the USB port.</strong>'
       +'<span>The keyboard '+esc(st.portChangeVidPid||'')+' is plugged into a different port — on the new port it is an ordinary keyboard again (Windows binds drivers per port). All your profiles are safe; one click restores everything:</span>'
-      +'<button class="btn primary small" style="margin-left:auto;white-space:nowrap" onclick="applyDriverSwap(\''+esc(st.portChangeVidPid||'')+'\')">Apply driver again</button></div>';
+      +'<button class="btn primary small" style="margin-left:auto;white-space:nowrap" onclick="applyDriverSwap(\''+jsStr(st.portChangeVidPid||'')+'\')">Apply driver again</button></div>';
   }
   h+='<div id="identifyFeed" class="identify-feed"></div>';
   if(!lastDevices.length){
@@ -675,7 +680,7 @@ async function identifyDeviceIdx(idx){
   toast('Press a key on this keyboard now…','info');
   try{
     for(let i=0;i<10;i++){
-      const r=await api('GET','/api/v1/devices/detect');
+      const r=await api('POST','/api/v1/devices/detect',{});
       if(r.detected&&r.detected.length>0){
         const found=d.winusbPath&&r.detected.some(x=>x.path===d.winusbPath);
         if(found){
@@ -696,7 +701,7 @@ async function testDeviceIdx(idx){
   if(!d)return;
   toast('Testing device…','info');
   try{
-    const r=await api('GET','/api/v1/devices/detect');
+    const r=await api('POST','/api/v1/devices/detect',{});
     const found=r.detected&&d.winusbPath&&r.detected.some(x=>x.path===d.winusbPath);
     toast(found?'✓ Device responds — keys will be captured!':'Device opened OK, but no key data. Press any key on this keyboard.','info');
   }catch(e){toast('Test failed: '+e.message,'error');}
@@ -1011,7 +1016,7 @@ async function renderWizard(){
     h+='<p class="modal-hint">For <b>'+esc(wizardState.selectedVidPid||'your keyboard')+'</b>. The wizard watches for the device to flip to WinUSB.</p>';
     h+='<div class="prep-item"><strong>Automatic swap (recommended)</strong>'
       +'<p>KeySidekick can bind the Microsoft-signed WinUSB driver itself — no Zadig needed (Windows 10 1809+).</p>'
-      +'<button class="btn primary" id="wizardAutoSwapBtn" onclick="applyDriverSwap(\''+esc(wizardState.selectedVidPid||'')+'\',\'wizard\')">Swap automatically (UAC prompt)</button>'
+      +'<button class="btn primary" id="wizardAutoSwapBtn" onclick="applyDriverSwap(\''+jsStr(wizardState.selectedVidPid||'')+'\',\'wizard\')">Swap automatically (UAC prompt)</button>'
       +' <span class="prep-hint">After the swap the list above flips to WinUSB-ready — press Continue.</span></div>';
     h+='<details class="advanced" style="margin:12px 0"><summary>Or do it manually with Zadig (fallback)</summary>';
     h+='<ol class="zadig-steps">';
@@ -1139,7 +1144,7 @@ async function wizardVerifyPress(){
   if(el){el.textContent='Press a key on this keyboard now…';el.className='prep-status listening';}
   try{
     for(let i=0;i<12;i++){
-      const r=await api('GET','/api/v1/devices/detect');
+      const r=await api('POST','/api/v1/devices/detect',{});
       const found=(r.detected&&r.detected.length>0)&&(!path||r.detected.some(d=>d.path===path));
       if(found){
         if(el){el.textContent='✓ Key captured!';el.className='prep-status ok';}
@@ -1303,14 +1308,14 @@ async function showDiagnostics(){
   h+='<table class="diag-table">';
   h+='<tr><td>Status</td><td class="'+(r.device==='connected'?'diag-ok':'diag-err')+'">'+r.device+'</td></tr>';
   h+='<tr><td>WinUSB Handle</td><td>'+(r.winusbHandle?'<span class="diag-ok">open</span>':'<span class="diag-err">closed</span>')+'</td></tr>';
-  h+='<tr><td>Pipe ID</td><td><code>'+r.pipeId+'</code></td></tr>';
-  h+='<tr><td>VID/PID</td><td><code>'+r.vidpid+'</code></td></tr>';
+  h+='<tr><td>Pipe ID</td><td><code>'+esc(r.pipeId)+'</code></td></tr>';
+  h+='<tr><td>VID/PID</td><td><code>'+esc(r.vidpid)+'</code></td></tr>';
   h+='<tr><td>Enumerated</td><td>'+(r.deviceEnumerated?'<span class="diag-ok">yes</span>':'<span class="diag-err">no</span>')+'</td></tr>';
   if(r.devicePath)h+='<tr><td>Path</td><td><code class="diag-path">'+esc(r.devicePath)+'</code></td></tr>';
   h+='</table></div>';
   h+='<div class="diag-section"><h3>Config</h3>';
   h+='<table class="diag-table">';
-  h+='<tr><td>File</td><td><code>'+r.configFile+'</code></td></tr>';
+  h+='<tr><td>File</td><td><code>'+esc(r.configFile)+'</code></td></tr>';
   h+='<tr><td>Exists</td><td>'+(r.configExists?'<span class="diag-ok">yes</span>':'<span class="diag-err">no</span>')+'</td></tr>';
   h+='<tr><td>Profiles</td><td>'+r.profileCount+'</td></tr>';
   h+='<tr><td>Applications</td><td>'+r.appCount+'</td></tr>';

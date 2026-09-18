@@ -7,14 +7,17 @@
 namespace {
 
 const unsigned short kPort = 8765;
-const std::size_t kMaxHeaderBytes = 16 * 1024;
-const std::size_t kMaxBodyBytes = 64 * 1024;
+// Лимиты и имя заголовка берём из продакшн-заголовка, а не дублируем: иначе
+// смена значения в src/ не ломает ни одного теста (SSOT-разрыв).
+const std::size_t kMaxHeaderBytes = keysidekick::kDefaultMaxHeaderBytes;
+const std::size_t kMaxBodyBytes = keysidekick::kDefaultMaxBodyBytes;
 const char kTokenHeader[] = "X-KeySidekick-Token";
 
 keysidekick::SecurityPolicy Policy(const std::string& token) {
     keysidekick::SecurityPolicy policy;
     policy.port = kPort;
-    policy.allow_ipv6_loopback = true;
+    // Как в sidekick.cpp: IPv6-loopback выключен (listener только на 127.0.0.1).
+    policy.allow_ipv6_loopback = false;
     policy.token_header_name = kTokenHeader;
     policy.token = token;
     policy.max_header_bytes = kMaxHeaderBytes;
@@ -162,7 +165,12 @@ void TestHelpersAndAdditionalPolicyEdges() {
 
     assert(keysidekick::IsMutationMethod("post"));
     assert(keysidekick::IsMutationPath("/api/capture/start"));
+    assert(keysidekick::IsMutationPath("/api/v1/devices/detect"));   // side effects: releases injected keys
+    assert(keysidekick::IsMutationPath("/api/v1/devices/capture"));
+    assert(keysidekick::IsMutationPath("/api/v1/preset/apply"));
     assert(!keysidekick::IsMutationPath("/api/status"));
+    assert(!keysidekick::IsMutationPath("/api/v1/startup"));         // GET reads the shortcut state
+    assert(!keysidekick::IsMutationPath("/api/v1/input/identify"));  // GET polls, POST arms
     assert(keysidekick::ConstantTimeTokenEquals("abcdef", "abcdef"));
     assert(!keysidekick::ConstantTimeTokenEquals("abcdef", "abcdeg"));
     assert(!keysidekick::ConstantTimeTokenEquals("abcdef", "abcdef0"));

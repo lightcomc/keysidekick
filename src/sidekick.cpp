@@ -1000,7 +1000,11 @@ static void LaunchApp(const std::string& path) {
 // отправятся при следующем нажатии когда окно появится.
 static HWND FindProfileTarget(const Profile& prof) {
     HWND h = FindTargetWindowScored(prof.targetClass, prof.targetExe, prof.targetPath);
-    if (!h) h = FindWindowByClass(prof.targetClass.c_str());
+    // FindWindowByClass не проверяет процесс: он допустим только как уточнение
+    // по классу, когда процесс не задан. Иначе (окно того же класса у ДРУГОГО
+    // приложения, либо unreadable-process кандидат) нажатия уходили бы чужому окну.
+    if (!h && prof.targetExe.empty() && !prof.targetClass.empty())
+        h = FindWindowByClass(prof.targetClass.c_str());
     return h;
 }
 
@@ -3534,23 +3538,6 @@ static DWORD WINAPI HttpThread(LPVOID) {
 // H3: обработка одного HTTP-соединения на воркере пула. Мутации сериализуются
 // через RunDashOp (main thread) и существующие критические секции; каждый
 // воркер работает со своим сокетом и локальными данными.
-static bool IsPostOnlyPath(const std::string& p) {
-    static const char* kPostOnly[] = {
-        "/api/profile/activate", "/api/profile", "/api/key", "/api/key/delete",
-        "/api/key/update", "/api/key/move", "/api/key/duplicate", "/api/reload",
-        "/api/capture/start",
-        "/api/v1/profile/create", "/api/v1/profile/delete", "/api/v1/profile/rename",
-        "/api/v1/profile/duplicate", "/api/v1/profile/link-app", "/api/v1/profile/unlink-app",
-        "/api/v1/profile/set-default-app", "/api/v1/applications/create",
-        "/api/v1/applications/test-resolve", "/api/v1/config/import",
-        "/api/v1/preset/apply", "/api/v1/devices/activate", "/api/v1/action/fire",
-        "/api/v1/windows/foreground/pick", "/api/v1/devices/capture",
-        "/api/v1/driver/swap", "/api/v1/driver/restore"
-    };
-    for (const char* s : kPostOnly) if (p == s) return true;
-    return false;
-}
-
 static void HandleHttpConnection(SOCKET cli) {
     // H1/H2: per-connection timeouts. SO_RCVTIMEO (5s) keeps one idle or
     // slow local client from stalling the only HTTP thread forever;
@@ -3707,7 +3694,7 @@ static void HandleHttpConnection(SOCKET cli) {
     // C1: legacy mutating GETs (/switch, /profile) отклоняются намертво —
     // канонический API переключения: POST /api/profile/activate.
     if ((method == "GET" || method == "HEAD") &&
-        (path == "/switch" || path == "/profile" || IsPostOnlyPath(path))) {
+        (path == "/switch" || path == "/profile" || keysidekick::IsMutationPath(path))) {
         HttpSendJson(cli,
             "{\"error\":\"state changes require POST\",\"code\":\"mutating_get_forbidden\"}", 405);
         closesocket(cli); return;
@@ -3806,13 +3793,25 @@ static void HandleHttpConnection(SOCKET cli) {
         std::string name;
         JsonGetStr(body, "name", name);
         if (name.empty()) {
-            // вернуть текущий (backwards-compat)
+            // вернуть текущий (backwards-compat) — JSON-ом, чтобы клиент не
+            // падал на JSON.parse (раньше здесь отдавался text/plain)
             EnterCriticalSection(&g_csProfile); std::string cur = g_activeProfile; LeaveCriticalSection(&g_csProfile);
-            HttpSend(cli, cur.c_str(), "text/plain");
+            HttpSendJson(cli, "{\"ok\":true,\"active\":\"" + JsonEscape(cur) + "\"}");
         } else {
-            char* dup = _strdup(name.c_str());
-            PostMessageW(g_hMsgWindow, WM_HTTP_SWITCH, (WPARAM)dup, 0);
-            HttpSendJson(cli, "{\"ok\":true,\"switching\":\"" + JsonEscape(name) + "\"}");
+            bool known = false;
+            EnterCriticalSection(&g_csProfile);
+            known = (g_profiles.find(name) != g_profiles.end());
+            LeaveCriticalSection(&g_csProfile);
+            if (!known) {
+                // Раньше отвечали ok:true до фактического переключения, а
+                // SwitchProfileByName молча ничего не делал для неизвестного
+                // имени — dashboard показывал «Active profile: X» без эффекта.
+                HttpSendJson(cli, "{\"error\":\"profile not found\"}", 404);
+            } else {
+                char* dup = _strdup(name.c_str());
+                PostMessageW(g_hMsgWindow, WM_HTTP_SWITCH, (WPARAM)dup, 0);
+                HttpSendJson(cli, "{\"ok\":true,\"switching\":\"" + JsonEscape(name) + "\"}");
+            }
         }
     }
     // POST /api/key  body {profile, usage, mod, action} → ADD_KEY
@@ -4627,9 +4626,12 @@ static void HandleHttpConnection(SOCKET cli) {
         j += "]}";
         HttpSendJson(cli, j);
     }
-    // GET /api/v1/devices/detect — probe each WinUSB keyboard: short read with 500ms timeout,
+    // POST /api/v1/devices/detect — probe each WinUSB keyboard: short read with 500ms timeout,
     // and tell the caller which device (if any) produced data. Used for "identify my keyboard".
-    else if (method == "GET" && path == "/api/v1/devices/detect") {
+    // Пробирование устройств + сброс инжекций.
+    // Это POST, а не GET: обработчик меняет состояние (ReleaseAllKeys) и
+    // открывает интерфейсы, поэтому он обязан требовать CSRF-токен.
+    else if (method == "POST" && path == "/api/v1/devices/detect") {
         // Страховка: сбрасываем все инжектированные клавиши ПЕРЕД пробированием —
         // даже одна украденная/потерянная key-up не оставит «залипший» Ctrl/Shift.
         ReleaseAllKeys();
