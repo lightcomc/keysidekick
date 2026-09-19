@@ -387,7 +387,8 @@ void TestRejectsFilesWithoutRecognizedSections() {
     // предохранитель не должен считать «мусором».
     {
         const char* candidates[] = {"src/config.example.ini", "../src/config.example.ini"};
-        for (std::size_t index = 0; index < 2; ++index) {
+        bool exampleParsed = false;
+        for (std::size_t index = 0; index < 2 && !exampleParsed; ++index) {
             std::ifstream input(candidates[index], std::ios::binary);
             if (!input) continue;
             std::ostringstream buffer;
@@ -395,8 +396,12 @@ void TestRejectsFilesWithoutRecognizedSections() {
             const ParseResult example = Parse(buffer.str());
             REQUIRE(example.ok());
             REQUIRE(example.config.profiles.size() >= 1);
-            break;
+            exampleParsed = true;
         }
+        // Раннер гарантирует CWD = корень репозитория (run_all_tests.sh делает
+        // cd "$(dirname "$0")"), поэтому отсутствие обоих путей — ошибка теста,
+        // а не повод молча ничего не проверять (тот же класс, что BA-22).
+        REQUIRE(exampleParsed);
     }
 }
 
