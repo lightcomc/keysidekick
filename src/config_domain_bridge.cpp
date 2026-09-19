@@ -74,8 +74,12 @@ DomainModel ConfigToDomain(const config::Config& config) {
         app.windowClass  = src.target_class;
         app.exePath      = src.target_path;
         app.processName  = src.target_exe;
-        // launchPolicy/windowPolicy: config has no concept — leave defaults (Never/ExistingOnly)
-        // auto_start/default_profile_id: config-only concepts, not carried into domain
+        // auto_start → launchPolicy: конфиг умеет только «запустить, если окна
+        // нет» (AutoStart=1), поэтому true = IfNotRunning, false = Never.
+        // windowPolicy остаётся дефолтной: у конфига нет её аналога.
+        app.launchPolicy = src.auto_start ? LaunchPolicy::IfNotRunning
+                                          : LaunchPolicy::Never;
+        // default_profile_id: остаётся config-only концептом.
         model.applications.push_back(app);
     }
 
@@ -199,7 +203,10 @@ config::Config DomainToConfig(const DomainModel& model,
         out.target_class = app.windowClass;
         out.target_exe   = app.processName;
         out.target_path  = app.exePath;
-        // auto_start / default_profile_id: domain has no concept — leave defaults
+        // launchPolicy → auto_start: конфиг хранит только бинарный флаг
+        // «запускать, если окна нет»; Always/IfNotRunning оба означают «да».
+        out.auto_start = (app.launchPolicy != LaunchPolicy::Never);
+        // default_profile_id: config-only концепт, здесь не переносится.
         config.applications.push_back(out);
     }
 

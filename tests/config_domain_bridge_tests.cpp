@@ -260,11 +260,38 @@ static void TestSerializeRoundTrip() {
     CHECK(domain2.applications[0].windowClass == "TAIMPMainForm");
 }
 
+static void TestLaunchPolicyRoundTrip() {
+    // AutoStart=1 (config) → LaunchPolicy::IfNotRunning (domain) → AutoStart=1 (config).
+    // Без этого маппинга чекбокс «запускать приложение, если окно не найдено»
+    // сбрасывался при каждом перезапуске (auto_start не доходил до domain).
+    // Файловый round-trip extension-строк проверяет config_v3_tests; здесь —
+    // только мост.
+    Config original = MakeAimpConfig();
+    original.applications[0].auto_start = true;
+
+    DomainModel domain = keysidekick::bridge::ConfigToDomain(original);
+    CHECK(domain.applications.size() == 1);
+    CHECK(domain.applications[0].launchPolicy == keysidekick::LaunchPolicy::IfNotRunning);
+
+    Config roundTripped = keysidekick::bridge::DomainToConfig(domain, original.general);
+    const Application* rtApp = FindConfigApp(roundTripped, "app-aimp");
+    CHECK(rtApp != 0);
+    CHECK(rtApp->auto_start);
+
+    // Обратная сторона: Never → AutoStart=0, иначе чекбокс в дашборде не снять.
+    domain.applications[0].launchPolicy = keysidekick::LaunchPolicy::Never;
+    Config disabled = keysidekick::bridge::DomainToConfig(domain, original.general);
+    const Application* offApp = FindConfigApp(disabled, "app-aimp");
+    CHECK(offApp != 0);
+    CHECK(!offApp->auto_start);
+}
+
 int main() {
     TestBasicRoundTrip();
     TestModifierConversion();
     TestParseLiveConfigIni();
     TestSerializeRoundTrip();
+    TestLaunchPolicyRoundTrip();
 
     if (g_failed == 0) {
         std::printf("All bridge tests passed (%d checks)\n", g_tests);

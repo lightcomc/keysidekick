@@ -197,6 +197,11 @@ static CRITICAL_SECTION g_csProfile;   // защита g_activeProfile + g_profi
 static keysidekick::DomainModel g_domain;
 // Сохраняем general settings между LoadConfig и WriteConfig (config_v3 GeneralSettings)
 static keysidekick::config::GeneralSettings g_configGeneral;
+// Extension-строки из прочитанного config.ini (неизвестные секции/ключи, включая
+// закомментированные примеры вроде [Application.*]): config_v3 их разбирает и
+// умеет писать обратно, но мост в domain о них не знает — раньше они молча
+// исчезали при первом сохранении из дашборда.
+static std::vector<keysidekick::config::Extension> g_configExtensions;
 
 // ---- Phase 4: Security + live state ----
 // CSRF token: генерируется при старте, embedded в dashboard HTML, проверяется на mutating POST.
@@ -275,10 +280,11 @@ static void ProjectDomainToRuntime() {
                 rp.targetClass = app->windowClass;
                 rp.targetExe   = app->processName;
                 rp.targetPath  = app->exePath;
+                // launchPolicy → autoStart (см. bridge): «запустить приложение,
+                // если окно не найдено» — то, чем пользуется HandleMissingProfileTarget.
+                rp.autoStart = (app->launchPolicy != keysidekick::LaunchPolicy::Never);
             }
         }
-        // autoStart: domain не хранит; config_v3 тоже теряет это поле в domain.
-        // Оставляем false (Phase 3 добавит launchPolicy → autoStart mapping).
 
         // Mappings: pass-through action strings
         for (std::size_t m = 0; m < dp.mappings.size(); ++m) {
@@ -4611,15 +4617,15 @@ static void HandleHttpConnection(SOCKET cli) {
                 if (!SetupDiGetDeviceInterfaceDetailA(hDev, &ifData, det, needed, NULL, NULL)) continue;
 
                 const char* dp = det->DevicePath;
-                // Extract VID/PID from path
+                // "vid_xxxx&pid_yyyy" собираем разбором VidPidMiFromString:
+                // прежняя арифметика по указателям давала обрезанное "vid_0406&"
+                // (длина считалась дважды относительной), поэтому дашборд не мог
+                // сопоставить устройство с найденным в /api/v1/hid.
+                std::string vid, pid, mi;
+                VidPidMiFromString(dp, vid, pid, mi);
                 std::string vidpid;
-                const char* vid = strstr(dp, "vid_");
-                if (vid) {
-                    const char* mi = strstr(dp, "&mi_");
-                    std::size_t vidEnd = mi ? (std::size_t)(mi - dp - (vid - dp)) : std::string::npos;
-                    if (vidEnd != std::string::npos) {
-                        vidpid.assign(dp + (vid - dp), vidEnd - (vid - dp));
-                    }
+                if (!vid.empty() && !pid.empty()) {
+                    vidpid = "vid_" + vid + "&pid_" + pid;
                 }
                 std::string displayName = vidpid.empty() ? "WinUSB Device" : vidpid;
                 if (!first) j += ",";
@@ -5332,6 +5338,7 @@ static void LoadConfig() {
         // Domain обязан соответствовать runtime: иначе следующий WriteConfig
         // (SyncRuntimeToDomain) воскресит старый набор профилей поверх файла.
         g_domain = keysidekick::DomainModel();
+        g_configExtensions.clear();
         EnsureBuiltinBasic();
         return;
     }
@@ -5350,6 +5357,7 @@ static void LoadConfig() {
         // Legacy-парсер наполняет только g_profiles; g_domain чистим, чтобы
         // проекция и запись не смешивали два разных набора профилей.
         g_domain = keysidekick::DomainModel();
+        g_configExtensions.clear();   // legacy-формат extension-строк не хранит
         EnsureBuiltinBasic();
         LoadConfigLegacy();
         return;
@@ -5363,6 +5371,7 @@ static void LoadConfig() {
 
     // 3. Сохранить general settings + конвертировать через bridge
     g_configGeneral = pr.config.general;
+    g_configExtensions = pr.config.extensions;   // вернём их при записи (см. WriteConfig)
     g_domain = keysidekick::bridge::ConfigToDomain(pr.config);
 
     // 4. Применить general settings к globals
@@ -5558,7 +5567,10 @@ static void SyncRuntimeToDomain() {
             }
             app->windowClass = rp.targetClass;
             app->processName = rp.targetExe;
-            app->exePath = rp.targetPath;
+            app->exePath     = rp.targetPath;
+            // Обратный маппинг: чекбокс autoStart в дашборде → launchPolicy.
+            app->launchPolicy = rp.autoStart ? keysidekick::LaunchPolicy::IfNotRunning
+                                             : keysidekick::LaunchPolicy::Never;
         }
 
         // Mappings: полностью перестроить из g_profiles
@@ -5591,6 +5603,10 @@ static bool WriteConfig() {
     // Sync runtime mutations → domain, then serialize through config_v3
     SyncRuntimeToDomain();
     keysidekick::config::Config config = keysidekick::bridge::DomainToConfig(g_domain, g_configGeneral);
+    // Domain не хранит extension-строки файла — возвращаем их из последнего
+    // успешного Parse, иначе первое же сохранение из дашборда стирает всё,
+    // что парсер обещал сохранить (неизвестные ключи/секции, примеры из шаблона).
+    config.extensions = g_configExtensions;
 
     keysidekick::config::SerializeResult sr = keysidekick::config::Serialize(config);
     if (!sr.ok()) {
@@ -5871,20 +5887,28 @@ static std::wstring DrvLowerW(std::wstring s) {
 // Все present-узлы, чей hardware ID начинается с USB\VID_xxxx&PID_yyyy.
 static bool DrvFindNodes(const std::string& vidpid, std::vector<DrvNode>& nodes) {
     if (vidpid.empty()) return false;
-    std::wstring pat;
-    {
-        int len = MultiByteToWideChar(CP_UTF8, 0, vidpid.c_str(), (int)vidpid.size(), NULL, 0);
-        if (len <= 0) return false;
-        pat.resize(len);
-        MultiByteToWideChar(CP_UTF8, 0, vidpid.c_str(), (int)vidpid.size(), &pat[0], len);
+    // VID/PID разбираем структурно (VidPidMiFromString), а не «всеми hex-символами
+    // строки»: литеральная 'd' из слов vid_/pid_ попадала в набор, сдвигала первые
+    // восемь цифр и давала needle вида "USB\VID_D046&PID_DDC5". Совпадений не
+    // бывает ни для одного реального устройства, поэтому --driver swap|restore|status
+    // всегда отвечал "No present device nodes match — is the keyboard plugged in?",
+    // а вслед за ним не работали кнопки свапа в дашборде и восстановление после
+    // смены USB-порта.
+    std::string vid, pid, mi;
+    VidPidMiFromString(vidpid, vid, pid, mi);
+    if (vid.size() != 4 || pid.size() != 4) return false;
+
+    // Сравнение идёт с DrvLowerW(hwid), поэтому needle обязан быть полностью
+    // в нижнем регистре: прежние литералы "USB\VID_"/"&PID_" заглавными не
+    // совпадали с приведённым к нижнему регистру hardware id никогда.
+    std::wstring needle = L"usb\\vid_";
+    for (std::size_t index = 0; index < vid.size(); ++index) {
+        needle += static_cast<wchar_t>(towlower(static_cast<unsigned char>(vid[index])));
     }
-    std::wstring hex;
-    for (auto c : pat) if (iswxdigit(c)) hex += towlower(c);
-    if (hex.size() < 8) return false;
-    wchar_t vp[64] = {0};
-    swprintf(vp, 64, L"USB\\VID_%c%c%c%c&PID_%c%c%c%c",
-             hex[0], hex[1], hex[2], hex[3], hex[4], hex[5], hex[6], hex[7]);
-    std::wstring needle = vp;
+    needle += L"&pid_";
+    for (std::size_t index = 0; index < pid.size(); ++index) {
+        needle += static_cast<wchar_t>(towlower(static_cast<unsigned char>(pid[index])));
+    }
 
     HDEVINFO hDev = SetupDiGetClassDevsW(NULL, NULL, NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
     if (hDev == INVALID_HANDLE_VALUE) return false;

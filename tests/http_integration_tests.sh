@@ -223,12 +223,24 @@ assert "startup disable → ok:true installed:false" "echo '$STARTUP_OFF' | grep
 echo ""
 echo "--- Driver swap endpoints ---"
 STATE_BODY=$(curl -fsS "$BASE/api/v1/state")
-SWAP_NOVID=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/driver/swap" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{}')
+# Без vidpid роут подставляет VID/PID, определённый как «сменился порт», и
+# запускает ЭЛЕВИРОВАННЫЙ свап (UAC). Из автотеста это недопустимо, поэтому при
+# ожидающей смене порта проверку пропускаем с явной пометкой, а сам запрос не
+# отправляем: прежний безусловный `= 400` был зелёным только на машинах, где
+# device из DeviceVIDPID не виден как обычная клавиатура.
+if echo "$STATE_BODY" | grep -q '"portChangeDetected":true'; then
+    SWAP_NOVID="skipped"
+    echo "  - swap without vidpid: skipped (port change pending → documented fallback launches UAC)"
+else
+    SWAP_NOVID=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/driver/swap" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{}')
+fi
 RESTORE_NOVID=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/driver/restore" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{}')
 SWAP_BADFMT=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/driver/swap" -H "Content-Type: application/json" -H "X-KeySidekick-Token: $TOKEN" -d '{"vidpid":"bad;format"}')
 SWAP_GET=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/driver/swap")
 assert "state exposes portChangeDetected" "echo "$STATE_BODY" | grep -q portChangeDetected"
-assert "swap without vidpid → 400" "[ '$SWAP_NOVID' = '400' ]"
+if [ "$SWAP_NOVID" != "skipped" ]; then
+    assert "swap without vidpid → 400" "[ '$SWAP_NOVID' = '400' ]"
+fi
 assert "restore without vidpid → 400" "[ '$RESTORE_NOVID' = '400' ]"
 assert "swap with bad vidpid format → 400" "[ '$SWAP_BADFMT' = '400' ]"
 assert "GET /api/v1/driver/swap → 405" "[ '$SWAP_GET' = '405' ]"
