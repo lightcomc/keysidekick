@@ -616,7 +616,7 @@ static ScanInfo UsageToSet1(int usage) {
         {0x2E,0x0D,false}, // =
         {0x2F,0x1A,false}, // [
         {0x30,0x1B,false}, // ]
-        {0x31,0x2B,false}, // \
+        {0x31,0x2B,false}, // backslash key
         {0x33,0x27,false}, // ;
         {0x34,0x28,false}, // '
         {0x35,0x29,false}, // `
@@ -1650,8 +1650,8 @@ static bool CfgmgrLoaded() {
     tried = true;
     HMODULE m = LoadLibraryW(L"cfgmgr32.dll");
     if (!m) return false;
-    g_pCM_Get_Parent = (FnCM_Get_Parent)GetProcAddress(m, "CM_Get_Parent");
-    g_pCM_Get_Device_IDW = (FnCM_Get_Device_IDW)GetProcAddress(m, "CM_Get_Device_IDW");
+    g_pCM_Get_Parent = reinterpret_cast<FnCM_Get_Parent>(reinterpret_cast<void(*)()>(GetProcAddress(m, "CM_Get_Parent")));
+    g_pCM_Get_Device_IDW = reinterpret_cast<FnCM_Get_Device_IDW>(reinterpret_cast<void(*)()>(GetProcAddress(m, "CM_Get_Device_IDW")));
     loaded = (g_pCM_Get_Parent && g_pCM_Get_Device_IDW);
     return loaded;
 }
@@ -1771,13 +1771,13 @@ static bool HidDllLoaded() {
     tried = true;
     HMODULE m = LoadLibraryW(L"hid.dll");
     if (!m) { Log("LoadLibrary(hid.dll) failed err=%lu", GetLastError()); return false; }
-    g_pHidD_GetHidGuid          = (FnHidD_GetHidGuid)GetProcAddress(m, "HidD_GetHidGuid");
-    g_pHidD_GetAttributes       = (FnHidD_GetAttributes)GetProcAddress(m, "HidD_GetAttributes");
-    g_pHidD_GetPreparsedData    = (FnHidD_GetPreparsedData)GetProcAddress(m, "HidD_GetPreparsedData");
-    g_pHidD_FreePreparsedData   = (FnHidD_FreePreparsedData)GetProcAddress(m, "HidD_FreePreparsedData");
-    g_pHidD_GetProductString    = (FnHidD_GetProductString)GetProcAddress(m, "HidD_GetProductString");
-    g_pHidD_GetManufacturerString = (FnHidD_GetManufacturerString)GetProcAddress(m, "HidD_GetManufacturerString");
-    g_pHidP_GetCaps             = (FnHidP_GetCaps)GetProcAddress(m, "HidP_GetCaps");
+    g_pHidD_GetHidGuid          = reinterpret_cast<FnHidD_GetHidGuid>(reinterpret_cast<void(*)()>(GetProcAddress(m, "HidD_GetHidGuid")));
+    g_pHidD_GetAttributes       = reinterpret_cast<FnHidD_GetAttributes>(reinterpret_cast<void(*)()>(GetProcAddress(m, "HidD_GetAttributes")));
+    g_pHidD_GetPreparsedData    = reinterpret_cast<FnHidD_GetPreparsedData>(reinterpret_cast<void(*)()>(GetProcAddress(m, "HidD_GetPreparsedData")));
+    g_pHidD_FreePreparsedData   = reinterpret_cast<FnHidD_FreePreparsedData>(reinterpret_cast<void(*)()>(GetProcAddress(m, "HidD_FreePreparsedData")));
+    g_pHidD_GetProductString    = reinterpret_cast<FnHidD_GetProductString>(reinterpret_cast<void(*)()>(GetProcAddress(m, "HidD_GetProductString")));
+    g_pHidD_GetManufacturerString = reinterpret_cast<FnHidD_GetManufacturerString>(reinterpret_cast<void(*)()>(GetProcAddress(m, "HidD_GetManufacturerString")));
+    g_pHidP_GetCaps             = reinterpret_cast<FnHidP_GetCaps>(reinterpret_cast<void(*)()>(GetProcAddress(m, "HidP_GetCaps")));
     loaded = g_pHidD_GetHidGuid && g_pHidD_GetAttributes && g_pHidD_GetPreparsedData &&
              g_pHidD_FreePreparsedData && g_pHidD_GetProductString && g_pHidD_GetManufacturerString &&
              g_pHidP_GetCaps;
@@ -2914,6 +2914,7 @@ static void ShowTrayMenu(HWND h, int x, int y) {
         _snwprintf(about, sizeof(about) / sizeof(about[0]),
                    L"KeySidekick %hs\nGPL-3.0\nDedicated keyboard controller \x2014 see README/docs for details.",
                    APP_VERSION);
+        about[sizeof(about) / sizeof(about[0]) - 1] = L'\0';   // _snwprintf не терминирует при усечении
         MessageBoxW(h, about, L"About KeySidekick", MB_OK | MB_ICONINFORMATION);
     } else if (cmd >= 1000) {
         int idx = cmd - 1000;
@@ -4726,9 +4727,8 @@ static void HandleHttpConnection(SOCKET cli) {
         ReleaseAllKeys();
         ReleaseAllTargetedKeys();
         std::string j = "{\"found\":null,\"counts\":{}";
-        DWORD start = GetTickCount();
         BYTE sampleBuf[8] = {0};
-        int bestGot = 0;
+        ULONG bestGot = 0;
         std::string bestPath;
 
         const GUID* guids[] = { &GUID_DEVINTERFACE_WINUSB, &GUID_DEVINTERFACE_TARGET_WINUSB, &GUID_DEVINTERFACE_LIBUSB0, NULL };
@@ -5675,9 +5675,23 @@ static void ReadLoop() {
     BYTE buf[8] = {0};
     OVERLAPPED ov = {0};
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!ov.hEvent) {
+        // Без события overlapped-чтение и MsgWaitForMultipleObjectsEx работать не
+        // могут: NULL в массиве хендлов — невалидный аргумент. Уходим в main-цикл.
+        Log("ReadLoop: CreateEvent failed err=%lu — cannot read the device", GetLastError());
+        return;
+    }
     bool readPending = false;
 
     while (g_running) {
+        if (!g_hWinUsb) {
+            // Инвариант: сюда попадаем только с открытым устройством (main зовёт
+            // ReadLoop после OpenDevice, а все ветки реконнекта при неудаче
+            // выходят из цикла). Явная проверка — страховка от падения на
+            // WinUsb_ReadPipe(NULL, ...) и заодно доказательство для анализатора.
+            Log("ReadLoop: device handle is closed — leaving the read loop");
+            break;
+        }
         if (!readPending) {
             ResetEvent(ov.hEvent);
             ULONG got = 0;
@@ -5711,7 +5725,15 @@ static void ReadLoop() {
                     g_powerResume = false;
                     Log("Reconnect after resume");
                     CloseDevice();
-                    if (!ReconnectDevice()) Sleep(2000);
+                    if (!ReconnectDevice()) {
+                        // Раньше здесь был Sleep(2000) и цикл продолжался — с
+                        // g_hWinUsb == NULL на входе WinUsb_ReadPipe, то есть
+                        // падением вместо ожидания. Возвращаемся в main-цикл: там
+                        // событийное ожидание WM_DEVICECHANGE и повторный OpenDevice.
+                        Log("Reconnect after resume failed — switching to event-driven wait");
+                        BumpRevision();
+                        break;
+                    }
                 }
             }
             readPending = false;
