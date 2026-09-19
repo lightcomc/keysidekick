@@ -42,28 +42,63 @@ if /I "%~1"=="--check-dashboard" (
   exit /b 0
 )
 
-REM --- Гейт предупреждений: компиляция без линковки, падение при любом warning.
-REM     Отдельный режим (а не -Werror в обычной сборке), чтобы новая версия
-REM     компилятора не ломала сборку, но гейт в CI оставался строгим.
+REM --- Гейт предупреждений: компиляция без линковки, падение при любом warning,
+REM     error или ненулевом коде компилятора. Отдельный режим (а не -Werror в
+REM     обычной сборке), чтобы новая версия компилятора не ломала релизную
+REM     сборку, но гейт в CI оставался строгим.
+REM     Грабли, на которые я уже наступил: нельзя опираться на «findstr ничего не
+REM     нашёл» как на признак успеха — если лог не создан или компилятор не
+REM     запустился, это выглядит точно так же. Поэтому проверяются код возврата
+REM     КАЖДОЙ компиляции и код возврата самого findstr (2 = файл не открылся).
 if /I "%~1"=="--check-warnings" (
   echo === Warning gate: %WARNFLAGS% ===
-  REM Путь к логу — через %TEMP% напрямую: переменная, заданная ВНУТРИ блока
-  REM в скобках, подставляется только с отложенным расширением, и `%WLOG%` здесь
-  REM раскрылся бы в пустую строку (гейт молча ничего не компилировал).
-  if exist "%TEMP%\keysidekick_warnings.log" del "%TEMP%\keysidekick_warnings.log"
-  for %%F in (%SRCS% probe_device.cpp) do "%GXX%" -O2 -fno-strict-aliasing -D_WIN32_WINNT=0x0600 %WARNFLAGS% -fsyntax-only "%%F" >> "%TEMP%\keysidekick_warnings.log" 2>&1
-  findstr /C:"warning:" "%TEMP%\keysidekick_warnings.log" >nul
-  if not errorlevel 1 (
-    echo Warnings found:
-    findstr /C:"warning:" "%TEMP%\keysidekick_warnings.log"
+  REM Лог рядом со скриптом; путь подставляется инлайном (%~dp0...) — переменная,
+  REM заданная внутри блока в скобках, раскрылась бы здесь пустой строкой.
+  if exist "%~dp0warnings.log" del "%~dp0warnings.log"
+  for %%F in (%SRCS% probe_device.cpp) do (
+    "%GXX%" -O2 -fno-strict-aliasing -D_WIN32_WINNT=0x0600 %WARNFLAGS% -fsyntax-only "%%F" >> "%~dp0warnings.log" 2>&1
+    if errorlevel 1 echo GATE_COMPILE_FAILED %%F>>"%~dp0warnings.log"
+  )
+  if not exist "%~dp0warnings.log" (
+    echo Warning gate FAILED: no compiler output at all — is g++ runnable?
     exit /b 1
   )
-  findstr /C:"error:" "%TEMP%\keysidekick_warnings.log" >nul
+  REM Наличие строк вида "file:line:col: warning:" — признак того, что компиляция
+  REM действительно прошла и что-то нашла. Отдельно ловим ненулевой код компилятора
+  REM и нечитаемый лог: без этого «ничего не скомпилировалось» выглядит как успех.
+  findstr /C:"GATE_COMPILE_FAILED" "%~dp0warnings.log" >nul
+  if errorlevel 2 (
+    echo Warning gate FAILED: cannot read the log at %~dp0warnings.log
+    exit /b 1
+  )
+  if not errorlevel 1 (
+    echo Compilation failed for:
+    findstr /C:"GATE_COMPILE_FAILED" "%~dp0warnings.log"
+    echo --- compiler diagnostics ---
+    findstr /C:"error:" "%~dp0warnings.log"
+    exit /b 1
+  )
+  findstr /C:"error:" "%~dp0warnings.log" >nul
+  if errorlevel 2 (
+    echo Warning gate FAILED: cannot read the log at %~dp0warnings.log
+    exit /b 1
+  )
   if not errorlevel 1 (
     echo Compilation errors found:
-    findstr /C:"error:" "%TEMP%\keysidekick_warnings.log"
+    findstr /C:"error:" "%~dp0warnings.log"
     exit /b 1
   )
+  findstr /C:"warning:" "%~dp0warnings.log" >nul
+  if errorlevel 2 (
+    echo Warning gate FAILED: cannot read the log at %~dp0warnings.log
+    exit /b 1
+  )
+  if not errorlevel 1 (
+    echo Warnings found:
+    findstr /C:"warning:" "%~dp0warnings.log"
+    exit /b 1
+  )
+  del "%~dp0warnings.log"
   echo Warning gate OK — no warnings in 12 translation units.
   exit /b 0
 )

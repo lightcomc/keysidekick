@@ -46,6 +46,10 @@ jobs:
           try { cmd /c build.bat } finally { Pop-Location }
           if ($LASTEXITCODE -ne 0) { throw "src\build.bat failed with exit code $LASTEXITCODE" }
 
+      # Гейт идёт ПОСЛЕ сборки осознанно: sidekick.cpp включает
+      # src/dashboard_embedded.generated.h, который генерируется самой сборкой и
+      # в git не хранится. До сборки на чистом checkout гейт упал бы не из-за
+      # предупреждений, а из-за отсутствующего заголовка.
       - name: Warning gate (-Wall -Wextra over every product translation unit)
         shell: powershell
         run: |

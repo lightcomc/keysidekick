@@ -12,6 +12,10 @@ GXX="${GXX:-C:/MinGW64/bin/g++.exe}"
 CXXFLAGS="-std=c++14 -D_WIN32_WINNT=0x0600 -Wall -Wextra -Wno-missing-field-initializers"
 OBJDIR=".ai-cache"
 mkdir -p "$OBJDIR"
+# Чистим прошлые логи сборки: в .ai-cache остаются файлы от прежних экспериментов
+# (например command_queue_modern.*), и устаревший warning в них сделал бы гейт
+# ниже вечно красным без видимой причины.
+rm -f "$OBJDIR"/*.build.log
 
 passed=0
 failed=0
