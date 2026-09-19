@@ -46,6 +46,14 @@ jobs:
           try { cmd /c build.bat } finally { Pop-Location }
           if ($LASTEXITCODE -ne 0) { throw "src\build.bat failed with exit code $LASTEXITCODE" }
 
+      - name: Warning gate (-Wall -Wextra over every product translation unit)
+        shell: powershell
+        run: |
+          $env:PATH = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;$env:PATH"
+          Push-Location src
+          try { cmd /c build.bat --check-warnings } finally { Pop-Location }
+          if ($LASTEXITCODE -ne 0) { throw "warning gate failed: see the listed warnings above" }
+
       # No staleness gate here: build.bat always regenerates
       # src/dashboard_embedded.generated.h from web/ sources on every build, so a
       # "verify embedded dashboard is up to date" step in CI is vacuous — the

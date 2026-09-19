@@ -6,7 +6,10 @@ set -e
 
 cd "$(dirname "$0")"
 GXX="${GXX:-C:/MinGW64/bin/g++.exe}"
-CXXFLAGS="-std=c++14 -D_WIN32_WINNT=0x0600"
+# Предупреждения включены всегда — те же классы, что в build.bat. Раньше наборы
+# собирались вообще без флагов, из-за чего, например, съеденная комментарием
+# строка таблицы scan-кодов и падение на power-resume дошли до релиза.
+CXXFLAGS="-std=c++14 -D_WIN32_WINNT=0x0600 -Wall -Wextra -Wno-missing-field-initializers"
 OBJDIR=".ai-cache"
 mkdir -p "$OBJDIR"
 
@@ -67,6 +70,17 @@ run_test runtime_state       "tests/runtime_state_tests.cpp src/runtime_state.cp
 run_test startup_manager     "tests/startup_manager_tests.cpp src/startup_manager.cpp" "-lole32 -luuid -loleaut32 -ltaskschd" "-std=c++17"
 
 echo ""
+# Гейт предупреждений для тестовых TU: флаги те же, что в build.bat. Предупреждение
+# здесь — дефект либо теста, либо модуля, который он проверяет (именно так в
+# продукте нашлась съеденная комментарием строка таблицы scan-кодов).
+test_warnings=$(grep -h "warning:" "$OBJDIR"/*.build.log 2>/dev/null | head -20 || true)
+if [ -n "$test_warnings" ]; then
+    failed=$((failed+1))
+    failed_names+=("compiler-warnings")
+    echo "=== Test build warnings ==="
+    echo "$test_warnings"
+fi
+
 echo "=== Results: $passed passed, $failed failed ==="
 
 if [ $failed -gt 0 ]; then
