@@ -1,39 +1,58 @@
-# KeySidekick 0.9.6 — Release Notes
+# KeySidekick 0.9.7 — Release Notes
 
-## What's new
+Патч-релиз по итогам полного аудита репозитория (68 находок, отчёт
+`BUGSAUDIT-2026-09-19.md`). Ничего нового в интерфейсе — только исправления,
+тесты и защита от регрессий.
 
-- **Identify window no longer polluted** — during the 15-second keypress-identify window the dedicated keyboard is not re-injected, so its keys don't type into the wizard and the Raw Input feed shows real devices only.
-- **Startup safety release** — Shift/Ctrl/Alt/Win are released on start to clean up any leftovers from a hard-killed previous instance.
+## Что исправлено (то, что видно в работе)
 
-- **Fixed: stuck Ctrl/Shift during device tests** — the wizard's detect/capture probes no longer steal input reports from the active keyboard (the root cause of injected modifiers staying pressed until unplug).
+- **Приложение больше не «умирает» после нескольких минут работы** — утечка
+  дескрипторов сокетов в HTTP-сервере: дашборд опрашивает состояние, и каждый
+  запрос оставлял за собой дескриптор (замер: +300 на 300 запросов). Внешне это
+  выглядело как «дашборд перестал отвечать», хотя процесс жив.
+- **Действие срабатывает ровно один раз** — раньше удержание action-клавиши и
+  нажатие другой клавиши повторно запускали макрос/приложение/переключение
+  профиля.
+- **Клавиши не залипают** — отпущенный Ctrl/Shift/Alt/Win больше не остаётся
+  нажатым во всей системе, а окно идентификации клавиатуры снимает ранее
+  инжектированные клавиши при открытии.
+- **Восстановлены клавиши `;`, стрелка вправо и Pause** в режиме обычной печати:
+  строка `;` была выключена комментарием в исходнике, Right печатал End, Pause —
+  Insert.
+- **Смена драйвера работает**: `sidekick.exe --driver swap|restore|status` не
+  находил устройство и отвечал «клавиатура не подключена?»; вместе с этим не
+  работали кнопки смены драйвера в дашборде и восстановление после переноса
+  клавиатуры в другой USB-порт. Теперь `--driver status` показывает, к какому
+  интерфейсу привяжется swap/restore, и при неоднозначности инструмент
+  отказывается угадывать (раньше мог привязать WinUSB к родительскому узлу
+  составного устройства — клавиатура перестала бы печатать).
+- **Нет падения после выхода из сна**, если клавиатура не переоткрылась.
+- **Настройки больше не теряются**: `AutoStart` профиля, неизвестные строки
+  `config.ini`, а также честная ошибка при неудачной записи конфига (раньше
+  дашборд сообщал «сохранено», а правка исчезала при перезапуске).
+- **Импорт конфига с другим портом** больше не превращает дашборд в «403 на
+  всё»: политика безопасности использует порт реально запущенного сервера, а
+  значение из файла применяется при следующем старте.
+- **Мусорный/чужой `config.ini`** теперь распознаётся как ошибка (с записью в
+  лог), а не молча подменяется значениями по умолчанию.
+- **Закрыта XSS в дашборде** — специально составленная строка действия (в том
+  числе из импортированного чужого конфига) выполняла произвольный код в
+  origin дашборда, где доступен CSRF-токен.
+- **Список устройств** (`/api/v1/devices`) отдаёт полный VID/PID вместо
+  обрезанного, поэтому корректно сопоставляется с данными `/api/v1/hid`.
 
-- **One file for everything** — the driver helper is now built into `sidekick.exe` (`--driver swap|restore|status`); the app itself never asks for admin rights, UAC appears only when you actually swap or restore the driver.
-- **Portable + fully offline** — carry the folder on a USB stick; profiles travel in `config.ini`; the program makes zero network connections (loopback dashboard only, no telemetry).
+## Что добавлено
 
-- **Driver swap without Zadig** — KeySidekick now swaps the keyboard driver itself via the Microsoft-signed inbox `winusb.inf` (`ks_driver.exe`, UAC prompt), and restores the normal HID driver any time. Zadig remains as a manual fallback.
-- **Port-change recovery** — plug the keyboard into another USB port and the dashboard offers a one-click "Apply driver again"; all profiles come back automatically (they are stored per VID/PID).
-
-- **First-run onboarding** — a guided 3-path start screen (pad template / create
-  profile / keyboard setup) for new installations.
-- **Driver-swap wizard** — step-by-step Zadig driver replacement flow right from
-  the dashboard, including risk disclosure and rollback guidance.
-- **HID device list** — the dashboard enumerates every input device
-  (keyboard/mouse/smart devices) with driver state: `ready` (WinUSB),
-  `needs-driver`, or `ordinary`.
-- **Keypress identification** — press a key and KeySidekick tells you which
-  physical device (VID/PID/name) produced it, so setup never requires guessing.
-- **AI-agent + use-case pad presets** — one-click pads for Codex, Claude,
-  ChatGPT, Cursor, Devin, Copilot, media players, OBS, Meet, Office, and DAW
-  suites (Reaper, DaVinci, Ableton, Premiere, Lightroom).
-- **Combo macros** — modifier+key chords (e.g. `{Ctrl+B}`) as first-class
-  mappings.
-- **Live click-to-fire** — fire any action from the Live screen and watch it
-  appear in the activity feed, without touching config.
-- **Fn layers** — function-key layers for pad keyboards.
-- **Export / import** — base64 config backup and restore straight from the
-  dashboard.
-- **Typed Action Builder** — visual multi-app action builder with an insertable
-  action grammar.
+- **Гейт предупреждений компилятора** — `src/build.bat --check-warnings`
+  проверяет все 12 единиц трансляции и падает при любом предупреждении или
+  ошибке; те же флаги включены в обычную сборку и в набор тестов, отдельный шаг
+  добавлен в CI. Именно отсутствие такой проверки позволило трём дефектам
+  (включая неработающую клавишу `;`) дойти до релиза.
+- **Тесты:** 16 наборов (добавлены `report_diff` — детект фронтов HID-отчётов, и
+  `mingw_threading` — потоки/мьютексы/условные переменные) и 58 HTTP-проверок
+  против живого сервера.
+- **Отчёт аудита** `BUGSAUDIT-2026-09-19.md`: покрытие по областям, 68 находок с
+  путями достижимости и проверками, журналы решений и правок.
 
 ## Install
 
@@ -41,21 +60,21 @@
 2. Run `run.bat` — on first start it creates `config.ini` from
    `config.example.ini` and launches `sidekick.exe`.
 3. Open the dashboard: `http://127.0.0.1:8765/`.
-4. Click **+ Setup keyboard** and follow the wizard — the one-time driver swap
-   uses [Zadig](https://zadig.akeo.ie/).
+4. Click **+ Setup keyboard** and follow the wizard. The driver swap is built in
+   (`sidekick.exe --driver swap`, UAC prompt once); [Zadig](https://zadig.akeo.ie/)
+   remains a manual fallback.
 
-## ⚠ One-time Zadig warning
+## ⚠ One-time driver warning
 
-After the driver swap your keyboard **stops typing on its own** — its keys no
-longer reach the foreground window and are read by KeySidekick instead. This is
-intended and is how the tool intercepts input. Keep a second keyboard (or the
-on-screen keyboard) handy while you configure profiles.
+После смены драйвера выделенная клавиатура **перестаёт печатать сама по себе** —
+её нажатия читает KeySidekick и отправляет по профилям. Это ожидаемое поведение:
+держите под рукой вторую клавиатуру или экранную, пока настраиваете профили.
 
 ## Rollback
 
-The driver swap is reversible. See
-[`ZADIG_INSTRUCTIONS.md`](ZADIG_INSTRUCTIONS.md) for the step-by-step undo
-procedure (reinstall the native HID keyboard driver via Zadig).
+Смена драйвера обратима: `sidekick.exe --driver restore vid_xxxx&pid_yyyy`
+(или `--driver status`, чтобы увидеть текущее состояние узлов). Ручной путь
+через [ZADIG_INSTRUCTIONS.md](ZADIG_INSTRUCTIONS.md) остаётся как запасной.
 
 ## Known limitations
 

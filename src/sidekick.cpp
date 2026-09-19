@@ -77,7 +77,7 @@ static const char* CONFIG_FILE = "config.ini";
 static const char* LOG_FILE    = "sidekick.log";
 
 // Product version — single source of truth (mirrored in resources.rc VERSIONINFO).
-static const char* APP_VERSION = "0.9.6";
+static const char* APP_VERSION = "0.9.7";
 
 // ---- Data path resolution ----
 // config.ini and sidekick.log resolve with fallback order:
