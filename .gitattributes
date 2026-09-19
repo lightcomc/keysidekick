@@ -1,0 +1,17 @@
+# Line endings are part of the contract for the files below — not a style choice.
+#
+# *.bat: cmd.exe requires CRLF. With LF-only line endings the parser collapses
+# the file, runs comment text as commands and can exit 0 without doing anything:
+# exactly that broke the CI build step (it "succeeded", no sidekick.exe was
+# produced, and the integration step failed with "No such file or directory").
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShell scripts: CRLF keeps them readable in Windows tooling.
+*.ps1 text eol=crlf
+
+# Resource scripts are compiled by windres on Windows.
+*.rc text eol=crlf
+
+# POSIX shell scripts run under MSYS bash: CRLF would break them.
+*.sh text eol=lf
