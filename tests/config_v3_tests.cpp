@@ -381,6 +381,23 @@ void TestRejectsFilesWithoutRecognizedSections() {
         const ParseResult general = Parse("[General]\nHTTPPort=8765\n");
         REQUIRE(general.ok());
     }
+
+    // Поставляемый пример обязан парситься без ошибок: его копируют себе
+    // пользователи, на нём проверяется первый запуск, и именно его правила
+    // предохранитель не должен считать «мусором».
+    {
+        const char* candidates[] = {"src/config.example.ini", "../src/config.example.ini"};
+        for (std::size_t index = 0; index < 2; ++index) {
+            std::ifstream input(candidates[index], std::ios::binary);
+            if (!input) continue;
+            std::ostringstream buffer;
+            buffer << input.rdbuf();
+            const ParseResult example = Parse(buffer.str());
+            REQUIRE(example.ok());
+            REQUIRE(example.config.profiles.size() >= 1);
+            break;
+        }
+    }
 }
 
 int main() {
