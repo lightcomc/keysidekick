@@ -385,17 +385,30 @@ void TestRejectsFilesWithoutRecognizedSections() {
     // Поставляемый пример обязан парситься без ошибок: его копируют себе
     // пользователи, на нём проверяется первый запуск, и именно его правила
     // предохранитель не должен считать «мусором».
+    //
+    // Проверяем именно файл, а не «что-то распарсилось»: пустая строка тоже даёт
+    // Parse("") == ok, поэтому одних ok()/profiles недостаточно — требуем, чтобы
+    // файл был реально открыт (is_open) и содержал признаки примера
+    // ([Application.*] и заполненный DeviceVIDPID). Путь можно переопределить
+    // переменной окружения KSK_EXAMPLE_CFG — так негативный контроль
+    // (несуществующий файл → тест обязан упасть) проверяется без правок кода.
     {
-        const char* candidates[] = {"src/config.example.ini", "../src/config.example.ini"};
+        const char* overridePath = std::getenv("KSK_EXAMPLE_CFG");
+        const char* candidates[] = {overridePath ? overridePath : "src/config.example.ini",
+                                    "../src/config.example.ini"};
         bool exampleParsed = false;
         for (std::size_t index = 0; index < 2 && !exampleParsed; ++index) {
             std::ifstream input(candidates[index], std::ios::binary);
-            if (!input) continue;
+            if (!input.is_open()) continue;
             std::ostringstream buffer;
             buffer << input.rdbuf();
-            const ParseResult example = Parse(buffer.str());
+            const std::string text = buffer.str();
+            REQUIRE(!text.empty());
+            const ParseResult example = Parse(text);
             REQUIRE(example.ok());
             REQUIRE(example.config.profiles.size() >= 1);
+            REQUIRE(example.config.applications.size() >= 1);      // [Application.aimp]
+            REQUIRE(!example.config.general.device_vid_pid.empty());  // DeviceVIDPID
             exampleParsed = true;
         }
         // Раннер гарантирует CWD = корень репозитория (run_all_tests.sh делает
