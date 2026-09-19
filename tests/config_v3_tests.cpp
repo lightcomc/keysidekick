@@ -342,6 +342,47 @@ struct TestCase {
 
 } // namespace
 
+void TestRejectsFilesWithoutRecognizedSections() {
+    const char* testName = "rejects files without recognized sections";
+
+    // Ни одной знакомой секции: не конфиг. Раньше такое молча принималось как
+    // «пустой конфиг», приложение стартовало на дефолтах, и первое сохранение
+    // из дашборда затирало файл.
+    {
+        const std::string garbage =
+            "[NotAConfig]\n"
+            "some_key=some_value\n"
+            "[AnotherUnknown]\n"
+            "x=1\n";
+        const ParseResult result = Parse(garbage);
+        REQUIRE(!result.ok());
+        bool sawError = false;
+        for (std::size_t index = 0; index < result.diagnostics.size(); ++index) {
+            if (result.diagnostics[index].severity ==
+                keysidekick::config::DIAGNOSTIC_ERROR) {
+                sawError = true;
+            }
+        }
+        REQUIRE(sawError);
+    }
+
+    // Пустой файл и файл из одних комментариев ошибкой не считаются: там нечего
+    // терять, и дефолты — законный результат.
+    {
+        const ParseResult empty = Parse("");
+        REQUIRE(empty.ok());
+        const ParseResult comments = Parse("# comment\n\n; another comment\n");
+        REQUIRE(comments.ok());
+    }
+
+    // Достаточно ОДНОЙ знакомой секции: легитимные legacy-конфиги и обычный
+    // [General] проходят (проверка на фикстурах v2 и [AIMP]+[Keys] — выше).
+    {
+        const ParseResult general = Parse("[General]\nHTTPPort=8765\n");
+        REQUIRE(general.ok());
+    }
+}
+
 int main() {
     const TestCase tests[] = {
         {"migrates v2 multi-profile fixture", TestMigratesV2MultiProfileFixture},
@@ -350,12 +391,14 @@ int main() {
         {"preserves modifiers and actions", TestPreservesModifiersAndActions},
         {"reports malformed input and escapes values", TestReportsMalformedAndEscapesValues},
         {"deterministic migration ids and output", TestDeterministicMigrationIdsAndOutput},
+        {"rejects files without recognized sections", TestRejectsFilesWithoutRecognizedSections},
     };
 
     for (std::size_t index = 0; index < sizeof(tests) / sizeof(tests[0]); ++index) {
         tests[index].run();
         std::cout << "PASS: " << tests[index].name << '\n';
     }
-    std::cout << "All config v3 tests passed (6/6).\n";
+    std::cout << "All config v3 tests passed (" << sizeof(tests) / sizeof(tests[0])
+              << "/" << sizeof(tests) / sizeof(tests[0]) << ").\n";
     return 0;
 }

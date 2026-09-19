@@ -5347,8 +5347,15 @@ static void LoadConfig() {
     keysidekick::config::ParseResult pr = keysidekick::config::Parse(fileContent);
     bool hasErrors = !pr.ok();
     if (hasErrors) {
+        // Считаем именно ERROR: в diagnostics есть и warning'и (например,
+        // «неизвестное поле сохранено»), из-за которых сообщение «N error(s)»
+        // вводило в заблуждение ровно тогда, когда по логу разбираются.
+        std::size_t errorCount = 0;
+        for (std::size_t i = 0; i < pr.diagnostics.size(); ++i) {
+            if (pr.diagnostics[i].severity == keysidekick::config::DIAGNOSTIC_ERROR) ++errorCount;
+        }
         Log("LoadConfig: config_v3 reported %zu error(s), falling back to legacy parser",
-            pr.diagnostics.size());
+            errorCount);
         for (std::size_t i = 0; i < pr.diagnostics.size() && i < 5; ++i) {
             if (pr.diagnostics[i].severity == keysidekick::config::DIAGNOSTIC_ERROR) {
                 Log("  ERROR: %s", pr.diagnostics[i].message.c_str());
@@ -5928,16 +5935,28 @@ static bool DrvFindNodes(const std::string& vidpid, std::vector<DrvNode>& nodes)
     return !nodes.empty();
 }
 
+// Интерфейс, который смене драйвера нужен у составного устройства.
+// Раньше при отсутствии &MI_00 молча возвращался nodes[0]: на реальном
+// приёмнике это РОДИТЕЛЬСКИЙ узел (hardware id без MI, service usbccgp) —
+// WinUSB привязался бы ко всему устройству, и клавиатура перестала бы печатать.
+// Теперь неоднозначность — это отказ (ноды печатаются вызывающим), а не догадка.
 static DrvNode* DrvPickForSwap(std::vector<DrvNode>& nodes) {
     for (auto& n : nodes)
         if (DrvLowerW(n.hardwareId).find(L"&mi_00") != std::wstring::npos) return &n;
-    return nodes.empty() ? NULL : &nodes[0];
+    return nodes.size() == 1 ? &nodes[0] : NULL;
 }
 
 static DrvNode* DrvPickForRestore(std::vector<DrvNode>& nodes) {
     for (auto& n : nodes)
         if (DrvLowerW(n.service) == L"winusb") return &n;
-    return nodes.empty() ? NULL : &nodes[0];
+    return nodes.size() == 1 ? &nodes[0] : NULL;
+}
+
+static void DrvPrintNodeList(const std::vector<DrvNode>& nodes) {
+    for (std::size_t index = 0; index < nodes.size(); ++index) {
+        printf("  - %ls (service: %ls)\n", nodes[index].hardwareId.c_str(),
+               nodes[index].service.empty() ? L"(none)" : nodes[index].service.c_str());
+    }
 }
 
 static int DrvDoBind(const std::string& vidpid, bool restore) {
@@ -5948,6 +5967,13 @@ static int DrvDoBind(const std::string& vidpid, bool restore) {
         return 2;
     }
     DrvNode* n = restore ? DrvPickForRestore(nodes) : DrvPickForSwap(nodes);
+    if (!n) {
+        printf("Refusing to guess: %s matches several interfaces, none of them identifiable as the %s target.\n",
+               vidpid.c_str(), restore ? "WinUSB" : "keyboard (&MI_00)");
+        DrvPrintNodeList(nodes);
+        printf("Pick the interface explicitly (Device Manager) or reconnect the keyboard directly.\n");
+        return 3;
+    }
     const wchar_t* inf = restore ? L"C:\\Windows\\INF\\input.inf" : L"C:\\Windows\\INF\\winusb.inf";
     printf("%s %s to: %ls\n", restore ? "Restoring inbox HID driver (input.inf)" : "Binding WinUSB (inbox winusb.inf)",
            restore ? "for" : "to", n->hardwareId.c_str());
@@ -5988,6 +6014,14 @@ static int DriverCliMain(int argc, char* argv[], int startIdx) {
             printf("      hardwareId: %ls\n", n.hardwareId.c_str());
             printf("      service:    %ls\n", n.service.empty() ? L"(none)" : n.service.c_str());
         }
+        // Dry-run выбора: status — единственный безопасный способ увидеть, к какому
+        // именно интерфейсу привяжется свап (сам свап требует UAC и меняет драйвер).
+        DrvNode* swapTarget = DrvPickForSwap(nodes);
+        DrvNode* restoreTarget = DrvPickForRestore(nodes);
+        if (swapTarget) printf("swap would bind WinUSB to: %ls\n", swapTarget->hardwareId.c_str());
+        else printf("swap would refuse: several interfaces, none with &MI_00\n");
+        if (restoreTarget) printf("restore would return to HID: %ls\n", restoreTarget->hardwareId.c_str());
+        else printf("restore would refuse: several interfaces, none on WinUSB\n");
         return 0;
     }
 

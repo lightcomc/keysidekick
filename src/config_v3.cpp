@@ -1137,11 +1137,42 @@ void WriteField(std::ostringstream& output,
 
 } // namespace
 
+// Есть ли в токенизированном файле хотя бы одна секция, которую понимает любой
+// из парсеров (v3: General/Application.*/Profile.*/Extension.*; legacy v2:
+// General/AIMP/Keys/Profile.*). Используется только для правила «не распознано
+// ничего» — см. Parse.
+bool HasRecognizedSection(const RawDocument& document) {
+    for (std::size_t index = 0; index < document.entries.size(); ++index) {
+        const IniEntry& entry = document.entries[index];
+        if (EqualsIgnoreCase(entry.section, "General")) return true;
+        if (EqualsIgnoreCase(entry.section, "AIMP")) return true;
+        if (EqualsIgnoreCase(entry.section, "Keys")) return true;
+        if (StartsWithIgnoreCase(entry.section, "Application.")) return true;
+        if (StartsWithIgnoreCase(entry.section, "Profile.")) return true;
+        if (StartsWithIgnoreCase(entry.section, "Extension.")) return true;
+    }
+    return false;
+}
+
 ParseResult Parse(const std::string& text) {
     const RawDocument document = Tokenize(text);
     int declared_version = 0;
-    if (HasSchemaVersion3(document, declared_version)) return ParseV3(document);
-    return ParseLegacy(document, declared_version);
+    ParseResult result = HasSchemaVersion3(document, declared_version)
+        ? ParseV3(document)
+        : ParseLegacy(document, declared_version);
+
+    // Файл, в котором не распознано НИ ОДНОЙ секции, — это не конфиг: он молча
+    // превращался в «пустой конфиг с дефолтами», приложение стартовало, а первое
+    // же сохранение из дашборда затирало пользовательский файл. Теперь это
+    // DIAGNOSTIC_ERROR, и предохранитель LoadConfig (fallback на legacy-парсер)
+    // перестаёт быть мёртвым кодом. Правило намеренно узкое: достаточно одной
+    // знакомой секции, поэтому валидные legacy-файлы ([AIMP]+[Keys],
+    // [Profile.*]) не задеваются.
+    if (!document.entries.empty() && !HasRecognizedSection(document)) {
+        AddDiagnostic(result.diagnostics, DIAGNOSTIC_ERROR, 0, std::string(), std::string(),
+                      "config contains no recognized sections — not a KeySidekick config");
+    }
+    return result;
 }
 
 SerializeResult Serialize(const Config& config) {
