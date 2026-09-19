@@ -49,10 +49,10 @@ struct CvFuncs {
 
     CvFuncs() {
         HMODULE h = GetModuleHandleW(L"kernel32.dll");
-        init = h ? (PfnInitCv)GetProcAddress(h, "InitializeConditionVariable") : NULL;
-        wake = h ? (PfnWakeCv)GetProcAddress(h, "WakeConditionVariable") : NULL;
-        wakeAll = h ? (PfnWakeAllCv)GetProcAddress(h, "WakeAllConditionVariable") : NULL;
-        sleepCs = h ? (PfnSleepCvCs)GetProcAddress(h, "SleepConditionVariableCS") : NULL;
+        init = h ? reinterpret_cast<PfnInitCv>(reinterpret_cast<void(*)()>(GetProcAddress(h, "InitializeConditionVariable"))) : NULL;
+        wake = h ? reinterpret_cast<PfnWakeCv>(reinterpret_cast<void(*)()>(GetProcAddress(h, "WakeConditionVariable"))) : NULL;
+        wakeAll = h ? reinterpret_cast<PfnWakeAllCv>(reinterpret_cast<void(*)()>(GetProcAddress(h, "WakeAllConditionVariable"))) : NULL;
+        sleepCs = h ? reinterpret_cast<PfnSleepCvCs>(reinterpret_cast<void(*)()>(GetProcAddress(h, "SleepConditionVariableCS"))) : NULL;
     }
 };
 
