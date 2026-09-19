@@ -5,7 +5,7 @@
 // ярлык в папке Startup: sidekick.cpp, обработчик POST /api/v1/startup.
 // Модуль сохранён как готовая реализация Task Scheduler-варианта и покрыт
 // tests/startup_manager_tests.cpp; подключать его к продукту или удалять —
-// решение владельца (BUGSAUDIT-2026-09-19, BA-32).
+// решение владельца.
 
 #include <optional>
 #include <string>
