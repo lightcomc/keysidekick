@@ -9,38 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.7] - 2026-09-19
 
-Патч-релиз по итогам полного аудита репозитория (68 находок). Ниже — то, что
-видно пользователю; внутренний отчёт аудита в репозиторий не входит.
+Patch release after a full audit of the repository (68 findings). Nothing new in
+the UI — fixes, tests and regression gates only.
 
 ### Fixed
 
-- **Утечка сокетов: API умирал после нескольких минут работы** — обработчик HTTP не закрывал принятое соединение на нормальном пути, поэтому дашборд, опрашивающий состояние, съедал по дескриптору на запрос (замер: +300 дескрипторов на 300 запросов) и приложение перестаёт принимать соединения, оставаясь запущенным.
-- **Действие срабатывало повторно, пока клавиша удерживается** — action-клавиша не попадала в отслеживаемое состояние, поэтому нажатие любой другой клавиши при удержании повторно запускало макрос/приложение/переключение профиля.
-- **Зажатые модификаторы** — диф модификаторов пропускался, если в том же отчёте была action-клавиша: отпущенный Ctrl/Shift/Alt/Win оставался нажатым во всей системе. Также окно identify теперь снимает инжектированные клавиши при открытии.
-- **Клавиши `;`, стрелка вправо и Pause не работали в basic-режиме** — строка таблицы scan-кодов для `;` была выключена комментарием с обратным слэшем в конце строки, Right отображался на scan-код End, Pause — на коды Insert.
-- **`sidekick.exe --driver swap|restore|status` не находил устройство** — идентификатор собирался из «всех hex-символов» аргумента (включая `d` из слов `vid_`/`pid_`) и сравнивался в другом регистре, поэтому команда отвечала «клавиатура не подключена?» на присутствующем устройстве; вместе с ней не работали кнопки смены драйвера в дашборде и восстановление после смены USB-порта. Теперь `--driver status` ещё и показывает, к какому интерфейсу привяжется swap/restore, а при неоднозначности инструмент отказывается угадывать (раньше мог привязать WinUSB к родительскому узлу составного устройства).
-- **Падение после выхода из сна**, если клавиатуру не удалось переоткрыть: вместо ожидания устройства вызывался `WinUsb_ReadPipe` с закрытым хендлом.
-- **`GET /api/v1/devices` отдавал обрезанный VID/PID** (`vid_0406&`), из-за чего список устройств не сопоставлялся с данными `/api/v1/hid`.
-- **Профиль с `AutoStart=1` терял настройку** — флаг не переносился между файлом и внутренней моделью, поэтому чекбокс «запускать приложение, если окно не найдено» сбрасывался при первом сохранении.
-- **Неизвестные строки `config.ini` исчезали** при первом сохранении из дашборда, хотя парсер обещал их сохранять (теперь возвращаются как `[Extension.*]`).
-- **Провал записи `config.ini` докладывался как успех** — правка оставалась в памяти и исчезала при перезапуске; теперь операция честно отвечает ошибкой (проверено на файле только для чтения: HTTP 500 вместо `{"ok":true}`).
-- **Порт из конфига расходился с живым listener'ом** — после импорта конфига с другим `HTTPPort` все запросы получали 403 при работающем сервере; теперь политика и URL-ы используют порт реально поднятого слушателя, а значение из файла применяется при следующем старте.
-- **Мусорный конфиг молча принимался за пустой** и перезаписывался: теперь файл без единой знакомой секции распознаётся как ошибка с записью в лог.
-- **CSRF-подобная XSS в дашборде** — строка действия подставлялась в inline-обработчик без экранирования обратного слэша: специально составленная строка (в том числе из импортированного чужого конфига) выполняла произвольный JS в origin дашборда, где доступен CSRF-токен. Используется существующий `jsStr()`.
-- **Состояние гонки на ledger'ах инжекций** — HTTP-воркеры сбрасывали клавиши одновременно с потоком чтения.
-- **`POST /api/profile/activate` отвечал успехом** даже когда профиль не найден; `POST /api/reload` — даже когда конфиг не прочитан.
-- **Гонка в шиме потоков** делала конкурентные тесты недостоверными: `join()` возвращался до выполнения потоков (копировался владеющий HANDLE).
+- **The app died after a few minutes of dashboard polling** — the HTTP handler never closed the accepted socket on the normal path, so every request (the dashboard polls state continuously) leaked a descriptor: measured +300 descriptors per 300 requests, after which `accept` failed while the process kept running.
+- **An action could fire twice** — an action-mapped key was dropped from the tracked held-set, so pressing any other key while it was held re-fired the macro / app launch / profile switch.
+- **Stuck modifiers** — the modifier diff was skipped whenever the same report contained an action key, so a released Ctrl/Shift/Alt/Win stayed held system-wide. The identify window now also releases injected keys when it opens.
+- **`;`, Right Arrow and Pause did not work in basic mode** — the `;` row of the scan-code table was commented out by a trailing backslash in a comment, Right was mapped to End's scan code and Pause to Insert's.
+- **`sidekick.exe --driver swap|restore|status` never found the device** — the id was built from every hex character of the argument (including the `d` in `vid_`/`pid_`) and compared in the wrong case, so the tool answered "is the keyboard plugged in?" for a present device; the dashboard's driver buttons and the post-port-change recovery were dead for the same reason. `--driver status` now also prints which interface swap/restore would target, and refuses to guess when several interfaces match (it used to be able to bind WinUSB to the composite parent node).
+- **Crash after resume from sleep** when the keyboard could not be reopened: `WinUsb_ReadPipe` was called with a closed handle instead of waiting for the device.
+- **`GET /api/v1/devices` returned a truncated VID/PID** (`vid_0406&`), so the device list did not match `/api/v1/hid`.
+- **A profile with `AutoStart=1` lost the setting** — the flag was not carried between the file and the internal model, so the "launch the app if the window is missing" checkbox reset on the first save.
+- **Unknown `config.ini` lines were dropped** on the first save from the dashboard even though the parser promised to keep them (they are now preserved as `[Extension.*]`).
+- **A failed `config.ini` write was reported as success** — the edit stayed in memory and vanished on restart; the operation now reports the failure (verified on a read-only file: HTTP 500 instead of `{"ok":true}`).
+- **The configured port could diverge from the live listener** — after importing a config with a different `HTTPPort` every request got 403 while the server was up; the security policy and URLs now use the port the listener actually bound, and the file value applies on the next start.
+- **A garbage config was silently treated as empty** and overwritten; a file without a single recognized section is now reported as an error in the log.
+- **DOM XSS in the dashboard** — an action string was injected into an inline handler without escaping the backslash, so a crafted string (including one from an imported foreign config) executed arbitrary JS in the dashboard origin where the CSRF token lives. The existing `jsStr()` is used now.
+- **Race on the injection ledgers** — HTTP workers released keys while the read loop was mutating the same containers.
+- **`POST /api/profile/activate` answered success** even when the profile did not exist; `POST /api/reload` answered success even when the config was unreadable.
+- **A race in the threading shim** made the concurrency tests meaningless: `join()` returned before the threads ran (it copied an owning HANDLE).
 
 ### Added
 
-- **Гейт предупреждений компилятора**: `src/build.bat --check-warnings` (12 единиц трансляции, падение при любом warning/error), те же флаги в обычной сборке и в наборе тестов, отдельный шаг в CI.
-- **Новые наборы тестов**: `report_diff` (детект фронтов HID-отчётов), `mingw_threading` (потоки/мьютексы/condition variable шима); всего 16 наборов и 58 HTTP-проверок.
+- **Compiler warning gate**: `src/build.bat --check-warnings` (12 translation units, fails on any warning or error), the same flags in the normal build and in the test runner, and a dedicated CI step.
+- **New test suites**: `report_diff` (HID report edge detection) and `mingw_threading` (shim threads/mutexes/condition variable); 16 suites and 58 HTTP checks in total.
 
 ### Security
 
-- Дашборд: экранирование значений в диагностике и в inline-обработчиках; единственный список «мутирующих» путей, `/api/v1/devices/detect` переведён на POST с обязательным токеном (раньше GET без токена сбрасывал удерживаемые клавиши).
-- Релизный ZIP больше не увозит приватный `src/config.ini` (устройство и профили разработчика).
-
+- Dashboard: escaping in diagnostics and inline handlers; a single list of "mutating" paths, with `/api/v1/devices/detect` moved to POST with the CSRF token required (a GET without a token used to release held keys).
+- The release ZIP no longer ships the developer's private `src/config.ini`.
 
 ## [0.9.6] - 2026-08-13
 

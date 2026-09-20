@@ -220,7 +220,7 @@ cd src
 build.bat
 ```
 
-`src\build.bat` 执行完整构建：通过 `web/generate_dashboard.ps1` 从 `web/` 重新生成内嵌 Web 仪表盘，用 `windres` 编译图标资源（`resources.rc` → `resources.o`），然后链接 `sidekick.exe`（全部 11 个 C++ 源文件 + `resources.o`、WinUSB/SetupAPI/user32/ws2_32/… 库）和 `probe_device.exe`。它首先查找 `C:\MinGW64\bin\g++.exe`，然后回退到 PATH 中的 `g++`——只要能找到 MinGW-w64 g++，两者都行。
+`src\build.bat` 执行完整构建：通过 `web/generate_dashboard.ps1` 从 `web/` 重新生成内嵌 Web 仪表盘，用 `windres` 编译图标资源（`resources.rc` → `resources.o`），然后链接 `sidekick.exe`（全部 11 个 C++ 源文件 + `resources.o`、WinUSB/SetupAPI/user32/ws2_32/… 库）和 `probe_device.exe`。它优先使用 PATH 中的 `g++`/`windres`，回退到 `C:\MinGW64\bin`——只要能找到 MinGW-w64 g++，两者都行。
 
 `probe_device.exe` 是一个诊断工具——Zadig 替换后运行它，可导出设备的接口 GUID、端点和 HID 报告描述符（确认标准的 8 字节键盘报告）。
 

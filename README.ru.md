@@ -220,7 +220,7 @@ cd src
 build.bat
 ```
 
-`src\build.bat` выполняет полную сборку: перегенерирует встроенный веб-дашборд из `web/` через `web/generate_dashboard.ps1`, компилирует иконки `windres`'ом (`resources.rc` → `resources.o`), затем линкует `sidekick.exe` (все 11 C++-исходников + `resources.o`, библиотеки WinUSB/SetupAPI/user32/ws2_32/…) и `probe_device.exe`. Сначала ищет `C:\MinGW64\bin\g++.exe`, затем откатывается на `g++` из PATH — подойдёт любой, лишь бы MinGW-w64 g++ был доступен.
+`src\build.bat` выполняет полную сборку: перегенерирует встроенный веб-дашборд из `web/` через `web/generate_dashboard.ps1`, компилирует иконки `windres`'ом (`resources.rc` → `resources.o`), затем линкует `sidekick.exe` (все 11 C++-исходников + `resources.o`, библиотеки WinUSB/SetupAPI/user32/ws2_32/…) и `probe_device.exe`. Сначала берёт `g++`/`windres` из PATH, затем откатывается на `C:\MinGW64\bin` — подойдёт любой, лишь бы MinGW-w64 g++ был доступен.
 
 `probe_device.exe` — диагностическая утилита: запустите после замены драйвера Zadig, чтобы выгрузить GUID интерфейса устройства, эндпоинты и HID report descriptor (подтверждает стандартный 8-байтовый keyboard report).
 

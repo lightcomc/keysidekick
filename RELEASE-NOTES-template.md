@@ -1,55 +1,54 @@
 # KeySidekick 0.9.7 — Release Notes
 
-Патч-релиз по итогам полного аудита репозитория (68 находок). Ничего нового в
-интерфейсе — только исправления, тесты и защита от регрессий.
+Patch release after a full audit of the repository (68 findings). Nothing new in
+the UI — fixes, tests and regression gates only.
 
-## Что исправлено (то, что видно в работе)
+## Fixed — what you actually notice
 
-- **Приложение больше не «умирает» после нескольких минут работы** — утечка
-  дескрипторов сокетов в HTTP-сервере: дашборд опрашивает состояние, и каждый
-  запрос оставлял за собой дескриптор (замер: +300 на 300 запросов). Внешне это
-  выглядело как «дашборд перестал отвечать», хотя процесс жив.
-- **Действие срабатывает ровно один раз** — раньше удержание action-клавиши и
-  нажатие другой клавиши повторно запускали макрос/приложение/переключение
-  профиля.
-- **Клавиши не залипают** — отпущенный Ctrl/Shift/Alt/Win больше не остаётся
-  нажатым во всей системе, а окно идентификации клавиатуры снимает ранее
-  инжектированные клавиши при открытии.
-- **Восстановлены клавиши `;`, стрелка вправо и Pause** в режиме обычной печати:
-  строка `;` была выключена комментарием в исходнике, Right печатал End, Pause —
-  Insert.
-- **Смена драйвера работает**: `sidekick.exe --driver swap|restore|status` не
-  находил устройство и отвечал «клавиатура не подключена?»; вместе с этим не
-  работали кнопки смены драйвера в дашборде и восстановление после переноса
-  клавиатуры в другой USB-порт. Теперь `--driver status` показывает, к какому
-  интерфейсу привяжется swap/restore, и при неоднозначности инструмент
-  отказывается угадывать (раньше мог привязать WinUSB к родительскому узлу
-  составного устройства — клавиатура перестала бы печатать).
-- **Нет падения после выхода из сна**, если клавиатура не переоткрылась.
-- **Настройки больше не теряются**: `AutoStart` профиля, неизвестные строки
-  `config.ini`, а также честная ошибка при неудачной записи конфига (раньше
-  дашборд сообщал «сохранено», а правка исчезала при перезапуске).
-- **Импорт конфига с другим портом** больше не превращает дашборд в «403 на
-  всё»: политика безопасности использует порт реально запущенного сервера, а
-  значение из файла применяется при следующем старте.
-- **Мусорный/чужой `config.ini`** теперь распознаётся как ошибка (с записью в
-  лог), а не молча подменяется значениями по умолчанию.
-- **Закрыта XSS в дашборде** — специально составленная строка действия (в том
-  числе из импортированного чужого конфига) выполняла произвольный код в
-  origin дашборда, где доступен CSRF-токен.
-- **Список устройств** (`/api/v1/devices`) отдаёт полный VID/PID вместо
-  обрезанного, поэтому корректно сопоставляется с данными `/api/v1/hid`.
+- **The app no longer dies after a few minutes of use** — the HTTP server leaked a
+  socket per request, and the dashboard polls state continuously (measured: +300
+  descriptors per 300 requests). It looked like "the dashboard stopped
+  responding" while the process was still running.
+- **An action fires exactly once** — holding an action key and pressing another
+  one used to re-fire the macro, relaunch the app or switch the profile again.
+- **Keys no longer stick** — a released Ctrl/Shift/Alt/Win stayed held
+  system-wide; the keyboard-identify window now also releases previously injected
+  keys when it opens.
+- **`;`, Right Arrow and Pause work again** in basic mode: the `;` row of the
+  scan-code table had been commented out in the source, Right typed End and Pause
+  typed Insert.
+- **Driver switching works**: `sidekick.exe --driver swap|restore|status` never
+  found the device and reported "is the keyboard plugged in?"; the dashboard's
+  driver buttons and the recovery after moving the keyboard to another USB port
+  were dead for the same reason. `--driver status` now shows which interface
+  swap/restore would target, and refuses to guess when several interfaces match
+  (it used to be able to bind WinUSB to the composite parent node, which would
+  stop the keyboard from typing).
+- **No crash after resume from sleep** when the keyboard cannot be reopened.
+- **Settings are kept**: profile `AutoStart`, unknown `config.ini` lines, and an
+  honest error when the config cannot be written (the dashboard used to say
+  "saved" while the edit vanished on restart).
+- **Importing a config with a different port** no longer turns the dashboard into
+  "403 on everything": the security policy uses the port the server actually
+  bound, and the file value applies on the next start.
+- **A garbage or foreign `config.ini`** is reported as an error in the log
+  instead of being silently replaced with defaults.
+- **Dashboard XSS closed** — a crafted action string (including one coming from an
+  imported foreign config) executed arbitrary code in the dashboard origin, where
+  the CSRF token lives.
+- **The device list** (`/api/v1/devices`) returns the full VID/PID instead of a
+  truncated one, so it matches the data from `/api/v1/hid`.
 
-## Что добавлено
+## Added
 
-- **Гейт предупреждений компилятора** — `src/build.bat --check-warnings`
-  проверяет все 12 единиц трансляции и падает при любом предупреждении или
-  ошибке; те же флаги включены в обычную сборку и в набор тестов, отдельный шаг
-  добавлен в CI. Именно отсутствие такой проверки позволило трём дефектам
-  (включая неработающую клавишу `;`) дойти до релиза.
-- **Тесты:** 16 наборов (добавлены `report_diff` — детект фронтов HID-отчётов, и
-  `mingw_threading` — потоки/мьютексы/условные переменные) и 58 HTTP-проверок
-  против живого сервера.
+- **Compiler warning gate** — `src/build.bat --check-warnings` checks all 12
+  translation units and fails on any warning or error; the same flags are enabled
+  in the normal build and in the test suite, with a dedicated CI step. The
+  absence of such a check is exactly what let three defects (including the
+  non-working `;` key) reach a release.
+- **Tests:** 16 suites (new: `report_diff` for HID report edge detection, and
+  `mingw_threading` for the threading shim) and 58 HTTP checks against a live
+  server.
 
 ## Install
 
@@ -63,15 +62,16 @@
 
 ## ⚠ One-time driver warning
 
-После смены драйвера выделенная клавиатура **перестаёт печатать сама по себе** —
-её нажатия читает KeySidekick и отправляет по профилям. Это ожидаемое поведение:
-держите под рукой вторую клавиатуру или экранную, пока настраиваете профили.
+After the driver swap the dedicated keyboard **stops typing on its own** — its
+keys are read by KeySidekick and sent to the configured profiles instead. This is
+intended: keep a second keyboard (or the on-screen keyboard) handy while you set
+up profiles.
 
 ## Rollback
 
-Смена драйвера обратима: `sidekick.exe --driver restore vid_xxxx&pid_yyyy`
-(или `--driver status`, чтобы увидеть текущее состояние узлов). Ручной путь
-через [ZADIG_INSTRUCTIONS.md](ZADIG_INSTRUCTIONS.md) остаётся как запасной.
+The driver swap is reversible: `sidekick.exe --driver restore vid_xxxx&pid_yyyy`
+(or `--driver status` to see the current state of the device nodes). The manual
+[ZADIG_INSTRUCTIONS.md](ZADIG_INSTRUCTIONS.md) path remains as a fallback.
 
 ## Known limitations
 
