@@ -1,0 +1,43 @@
+name: sync-release-notes
+
+# Release notes live in RELEASE-NOTES-template.md and are published as the body
+# of the GitHub release by .github/workflows/build.yml. That workflow creates the
+# release once; on later runs action-gh-release finds the existing release and
+# refreshes only the assets, so a body that was published once stays frozen even
+# after the notes file is corrected in the repo.
+#
+# This workflow closes that gap: when the notes file changes on master, the body
+# of the already-published release for the current APP_VERSION is rewritten from
+# it. Nothing else about the release is touched (assets and tag stay as they are).
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'RELEASE-NOTES-template.md'
+      - '.github/workflows/sync-release-notes.yml'
+
+jobs:
+  sync-body:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update the published release body from the notes file
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          version=$(grep -o 'APP_VERSION = "[^"]*"' src/sidekick.cpp | head -1 | sed 's/.*"\(.*\)"/\1/')
+          tag="v${version}"
+          echo "APP_VERSION=${version} -> tag ${tag}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file RELEASE-NOTES-template.md
+            echo "Release body of ${tag} updated from RELEASE-NOTES-template.md"
+          else
+            echo "No published release for ${tag} yet — nothing to sync."
+          fi
