@@ -1,7 +1,16 @@
 const HID_NAMES={0x04:"A",0x05:"B",0x06:"C",0x07:"D",0x08:"E",0x09:"F",0x0A:"G",0x0B:"H",0x0C:"I",0x0D:"J",0x0E:"K",0x0F:"L",0x10:"M",0x11:"N",0x12:"O",0x13:"P",0x14:"Q",0x15:"R",0x16:"S",0x17:"T",0x18:"U",0x19:"V",0x1A:"W",0x1B:"X",0x1C:"Y",0x1D:"Z",0x1E:"1",0x1F:"2",0x20:"3",0x21:"4",0x22:"5",0x23:"6",0x24:"7",0x25:"8",0x26:"9",0x27:"0",0x28:"Enter",0x29:"Esc",0x2A:"Backspace",0x2B:"Tab",0x2C:"Space",0x2D:"-",0x2E:"=",0x2F:"[",0x30:"]",0x31:"\\\\",0x33:";",0x34:"'",0x35:"`",0x36:",",0x37:".",0x38:"/",0x39:"CapsLock",0x3A:"F1",0x3B:"F2",0x3C:"F3",0x3D:"F4",0x3E:"F5",0x3F:"F6",0x40:"F7",0x41:"F8",0x42:"F9",0x43:"F10",0x44:"F11",0x45:"F12",0x46:"PrintScreen",0x47:"ScrollLock",0x48:"Pause",0x49:"Insert",0x4A:"Home",0x4B:"PageUp",0x4C:"Delete",0x4D:"End",0x4E:"PageDown",0x4F:"Right",0x50:"Left",0x51:"Down",0x52:"Up",0x53:"NumLock",0x54:"Num/",0x55:"Num*",0x56:"Num-",0x57:"Num+",0x58:"NumEnter",0x59:"Num1",0x5A:"Num2",0x5B:"Num3",0x5C:"Num4",0x5D:"Num5",0x5E:"Num6",0x5F:"Num7",0x60:"Num8",0x61:"Num9",0x62:"Num0",0x63:"Num."};
 // Phase 4: CSRF token injected by server at serve time
 const CSRF_TOKEN=/*{{CSRF_TOKEN}}*/"";
-let LAST_REVISION=/*{{STATE_REVISION}}*/"0";
+let LAST_REVISION=Number(/*{{STATE_REVISION}}*/"0")||0;
+// Единая точка обратной связи: обработчики дашборда вызываются прямо из onclick
+// без try/catch, поэтому раньше неудачный запрос не оставлял вообще ничего —
+// пользователь видел «ничего не произошло». Один глобальный перехватчик закрывает
+// весь этот класс (BA-52), не переписывая два десятка вызовов.
+window.addEventListener('unhandledrejection',function(event){
+  const reason=event&&event.reason;
+  const text=(reason&&reason.message)?reason.message:String(reason||'request failed');
+  if(typeof toast==='function')toast(text,'error');
+});
 function keyName(u){return HID_NAMES[u]||("?0x"+u.toString(16));}
 // Reverse table: key name (lowercase) → usage ID. Users can type q/w/f1/space.
 const NAME_TO_USAGE=(()=>{const m={};for(const u in HID_NAMES){m[HID_NAMES[u].toLowerCase()]=parseInt(u);}return m;})();
@@ -839,6 +848,10 @@ async function applyDriverSwap(vidpid,label){
   }catch(e){ toast('Swap failed: '+e.message,'error'); }
 }
 async function restoreOriginalDriver(vidpid){
+  // Возврат на штатный драйвер — необратимое для текущей настройки действие
+  // (клавиатура снова станет обычной, пока драйвер не сменят заново), и раньше
+  // оно выполнялось одним кликом без вопросов.
+  if(!confirm('Return '+vidpid+' to the standard HID driver?\n\nThe keyboard becomes an ordinary keyboard again until you swap the driver back.'))return;
   try{
     const r=await api('POST','/api/v1/driver/restore',{vidpid:vidpid});
     toast(r.ok?'Restore started — confirm the UAC prompt':('Restore failed: '+(r.error||'unknown')),r.ok?'success':'error');
@@ -1342,6 +1355,7 @@ async function showDiagnostics(){
   document.getElementById('editor').innerHTML=h;
 }
 function showHelp(){
+  stopAllPolling();
   currentView='help';
   renderSidebar();
   let h='<div class="toolbar"><h2>Help / Setup</h2></div>';
@@ -1614,8 +1628,9 @@ function connectSSE(){
     sse.addEventListener('revision',async(e)=>{
       try{
         const d=JSON.parse(e.data);
-        if(d.revision&&d.revision!==LAST_REVISION){
-          LAST_REVISION=d.revision;
+        const rev=Number(d.revision);
+        if(rev&&rev!==LAST_REVISION){
+          LAST_REVISION=rev;
           if(profileDirty){renderSidebar();return;}
           await refresh();
         }

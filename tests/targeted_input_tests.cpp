@@ -13,6 +13,8 @@ using keysidekick::TargetedInputLedger;
 using keysidekick::TargetedKey;
 using keysidekick::TargetedMessageState;
 using keysidekick::TargetedMessageStateBits;
+using keysidekick::WindowClassHash;
+using keysidekick::WindowIdentityMatches;
 
 void Require(bool condition, const char* expression, const char* testName) {
     if (condition) return;
@@ -27,7 +29,9 @@ TargetedKey MakeKey(int usageId,
                     std::uintptr_t target,
                     std::uint16_t virtualKey,
                     std::uint64_t nextRepeatAtMs,
-                    std::uint32_t repeatIntervalMs) {
+                    std::uint32_t repeatIntervalMs,
+                    std::uint32_t processId = 0,
+                    std::uint64_t classHash = 0) {
     TargetedKey key = {
         usageId,
         target,
@@ -35,7 +39,9 @@ TargetedKey MakeKey(int usageId,
         static_cast<std::uint16_t>(virtualKey + 1),
         false,
         nextRepeatAtMs,
-        repeatIntervalMs
+        repeatIntervalMs,
+        processId,
+        classHash
     };
     return key;
 }
@@ -117,6 +123,59 @@ void TestReleaseAllIsReverseAndClears() {
     REQUIRE(ledger.releaseAll().empty());
 }
 
+void TestWindowIdentityMatchesRequiresExactProcessAndClass() {
+    const char* testName = "window identity requires exact process and class";
+    // Захвачено при key-down: usage 0x57 в окне pid=4242 класса "Notepad".
+    const TargetedKey key =
+        MakeKey(0x1A, 0x1001, 0x57, 500, 50, 4242, 0x8842B206A7BFC712ull);
+
+    REQUIRE(WindowIdentityMatches(key, 4242, 0x8842B206A7BFC712ull));
+    // Дескриптор переиспользован другим процессом — класс тот же, окно чужое.
+    REQUIRE(!WindowIdentityMatches(key, 4243, 0x8842B206A7BFC712ull));
+    // Тот же процесс, но окно другого класса.
+    REQUIRE(!WindowIdentityMatches(key, 4242, 0x8842B206A7BFC713ull));
+    // Неизвестный процесс/класс (запрос не удался) — тоже не совпадение.
+    REQUIRE(!WindowIdentityMatches(key, 0, 0));
+}
+
+void TestWindowClassHashIsStableAndCaseSensitive() {
+    const char* testName = "window class hash is stable and case sensitive";
+    REQUIRE(WindowClassHash("Notepad") == WindowClassHash("Notepad"));
+    REQUIRE(WindowClassHash("Notepad") != WindowClassHash("notepad"));
+    REQUIRE(WindowClassHash("Notepad") != WindowClassHash("Notepad2"));
+    // Ключ хеша должен лежать внутри 64 бит: старшие разряды не отбрасываются.
+    REQUIRE(WindowClassHash("Chrome_WidgetWin_1") !=
+            static_cast<std::uint64_t>(static_cast<std::uint32_t>(
+                WindowClassHash("Chrome_WidgetWin_1"))));
+    REQUIRE(WindowClassHash("") == WindowClassHash(NULL));
+    REQUIRE(WindowClassHash("") != 0ull);
+}
+
+void TestIdentitySurvivesLedgerRoundTrip() {
+    const char* testName = "identity survives ledger round trip";
+    TargetedInputLedger ledger;
+    const TargetedKey key =
+        MakeKey(0x1A, 0x2002, 0x57, 1000, 100, 777, 0x13B028A4ABFBC4EEull);
+    REQUIRE(ledger.recordDown(key));
+
+    const std::vector<TargetedKey> due = ledger.dueRepeats(1000);
+    REQUIRE(due.size() == 1);
+    REQUIRE(WindowIdentityMatches(due[0], 777, 0x13B028A4ABFBC4EEull));
+
+    TargetedKey released = MakeKey(0, 0, 0, 0, 0);
+    REQUIRE(ledger.recordUp(0x1A, &released));
+    REQUIRE(WindowIdentityMatches(released, 777, 0x13B028A4ABFBC4EEull));
+    // Учётная запись без идентичности не должна «совпасть» с живым окном.
+    REQUIRE(!WindowIdentityMatches(MakeKey(0x1B, 0x2002, 0x58, 1000, 100),
+                                   777, 0x13B028A4ABFBC4EEull));
+
+    // releaseAll (выключение/профиль) тоже обязан вернуть идентичность.
+    REQUIRE(ledger.recordDown(key));
+    const std::vector<TargetedKey> all = ledger.releaseAll();
+    REQUIRE(all.size() == 1);
+    REQUIRE(WindowIdentityMatches(all[0], 777, 0x13B028A4ABFBC4EEull));
+}
+
 void TestKeyboardRepeatSettingsAreClamped() {
     const char* testName = "keyboard repeat settings are clamped";
     REQUIRE(KeyboardRepeatDelayMs(0) == 250);
@@ -151,6 +210,11 @@ int main() {
         {"repeat scheduling avoids bursts", TestRepeatSchedulingAvoidsBursts},
         {"next deadline uses earliest hold", TestNextDeadlineUsesEarliestHold},
         {"release all is reverse and clears", TestReleaseAllIsReverseAndClears},
+        {"window identity requires exact process and class",
+         TestWindowIdentityMatchesRequiresExactProcessAndClass},
+        {"window class hash is stable and case sensitive",
+         TestWindowClassHashIsStableAndCaseSensitive},
+        {"identity survives ledger round trip", TestIdentitySurvivesLedgerRoundTrip},
         {"keyboard repeat settings are clamped", TestKeyboardRepeatSettingsAreClamped},
         {"message state bits match Win32 contract", TestMessageStateBitsMatchWin32Contract},
     };
@@ -160,6 +224,6 @@ int main() {
         std::cout << "PASS: " << test.name << '\n';
     }
 
-    std::cout << "All targeted input tests passed (7/7).\n";
+    std::cout << "All targeted input tests passed (10/10).\n";
     return 0;
 }

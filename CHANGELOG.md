@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-09-20
+
+Follow-up to the 0.9.7 audit: removes the last dead module, closes two defects
+that were left open, and makes the checks themselves honest.
+
+### Fixed
+
+- **Deleting a profile that other profiles switch to is refused now** — the guard existed but could never fire: actions are stored as raw `!switch:` / `!toggle:` strings, which the check did not look at, so a profile could be deleted while mappings still pointed at it. The check now matches both the profile id and its display name, case-insensitively, and understands the carrier string.
+- **A key can no longer be delivered to the wrong window** — in targeted mode the ledger remembers the target's process id and window class and re-validates them before every repeat and key-up. Previously only `IsWindow()` was checked, so a window that inherited a recycled handle value received repeats and a key-up it never saw a key-down for.
+- **`probe_device.exe` reports the truth** — the interface line is printed again (a failed settings query was swallowed and the endpoint loop then iterated a garbage count), the HID report length is read only when the full 9-byte descriptor arrived, a too-long device path is reported instead of handing an uninitialised buffer to `CreateFileW`, and the exit code reflects probe failures (2 = every matched device failed) instead of always reporting success.
+- **Dashboard feedback** — a failed request now always surfaces as a message: one global handler covers every action that had no error handling; the live-update revision comparison works (it compared a string with a number, so the deduplication never triggered); Help no longer leaves background polls running; returning the keyboard to the standard driver asks for confirmation first.
+- **Dead variable removed** (`g_trayIcon`, unused since 0.9.x — found by the stricter warning gate below).
+
+### Changed
+
+- **Removed the unused Task Scheduler startup module** (`src/startup_manager.*` and its test suite, never linked into `sidekick.exe`). Autostart in the shipped build is the Startup-folder shortcut, verified end-to-end: enabling creates the shortcut, `GET /api/v1/startup` reports it, disabling removes it. Test suites: 15.
+
+### Added
+
+- **`src/build.bat --check-msvc`** — a second gate using MSVC's `cl /analyze` over the same translation units (reviewed codes suppressed explicitly), now part of CI alongside the GCC warning gate.
+- **The warning gate compiles for real** — it used `-fsyntax-only`, which never reaches the pass that reports unused file-scope variables; that is exactly how the dead `g_trayIcon` survived to a release. It now compiles to an object file, and a deliberate unused variable makes it fail (verified).
+- **Release notes are kept in sync with the published release** — a workflow updates the body of the published release from `RELEASE-NOTES-template.md` when the file changes, because the release action only refreshes assets on re-runs.
+
+
 ## [0.9.7] - 2026-09-19
 
 Patch release after a full audit of the repository (68 findings). Nothing new in

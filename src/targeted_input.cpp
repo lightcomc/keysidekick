@@ -66,6 +66,19 @@ bool TargetedInputLedger::empty() const {
     return heldKeys_.empty();
 }
 
+std::uint64_t WindowClassHash(const char* className) {
+    // Те же константы FNV-1a 64, что в config_v3::StableHash, но по C-строке:
+    // имя класса приходит из GetClassNameA, аллокация на каждый repeat не нужна.
+    std::uint64_t hash = UINT64_C(14695981039346656037);
+    if (!className) return hash;
+
+    for (const char* symbol = className; *symbol; ++symbol) {
+        hash ^= static_cast<unsigned char>(*symbol);
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 std::uint32_t KeyboardRepeatDelayMs(unsigned int setting) {
     const unsigned int clamped = std::min(setting, 3u);
     return (clamped + 1u) * 250u;

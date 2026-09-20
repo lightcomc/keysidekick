@@ -1,54 +1,55 @@
-# KeySidekick 0.9.7 — Release Notes
+# KeySidekick 0.9.8 — Release Notes
 
-Patch release after a full audit of the repository (68 findings). Nothing new in
-the UI — fixes, tests and regression gates only.
+Follow-up to the 0.9.7 audit. Nothing new in the UI — the last dead module is
+gone, two defects that were left open are fixed, and the checks themselves are
+now honest.
 
 ## Fixed — what you actually notice
 
-- **The app no longer dies after a few minutes of use** — the HTTP server leaked a
-  socket per request, and the dashboard polls state continuously (measured: +300
-  descriptors per 300 requests). It looked like "the dashboard stopped
-  responding" while the process was still running.
-- **An action fires exactly once** — holding an action key and pressing another
-  one used to re-fire the macro, relaunch the app or switch the profile again.
-- **Keys no longer stick** — a released Ctrl/Shift/Alt/Win stayed held
-  system-wide; the keyboard-identify window now also releases previously injected
-  keys when it opens.
-- **`;`, Right Arrow and Pause work again** in basic mode: the `;` row of the
-  scan-code table had been commented out in the source, Right typed End and Pause
-  typed Insert.
-- **Driver switching works**: `sidekick.exe --driver swap|restore|status` never
-  found the device and reported "is the keyboard plugged in?"; the dashboard's
-  driver buttons and the recovery after moving the keyboard to another USB port
-  were dead for the same reason. `--driver status` now shows which interface
-  swap/restore would target, and refuses to guess when several interfaces match
-  (it used to be able to bind WinUSB to the composite parent node, which would
-  stop the keyboard from typing).
-- **No crash after resume from sleep** when the keyboard cannot be reopened.
-- **Settings are kept**: profile `AutoStart`, unknown `config.ini` lines, and an
-  honest error when the config cannot be written (the dashboard used to say
-  "saved" while the edit vanished on restart).
-- **Importing a config with a different port** no longer turns the dashboard into
-  "403 on everything": the security policy uses the port the server actually
-  bound, and the file value applies on the next start.
-- **A garbage or foreign `config.ini`** is reported as an error in the log
-  instead of being silently replaced with defaults.
-- **Dashboard XSS closed** — a crafted action string (including one coming from an
-  imported foreign config) executed arbitrary code in the dashboard origin, where
-  the CSRF token lives.
-- **The device list** (`/api/v1/devices`) returns the full VID/PID instead of a
-  truncated one, so it matches the data from `/api/v1/hid`.
+- **You can no longer delete a profile that other profiles switch to.** The guard
+  existed but never fired (actions are stored as raw `!switch:` / `!toggle:`
+  strings, which the check did not inspect), so deleting such a profile left
+  mappings pointing at nothing. It now refuses and names the profile.
+- **A key in targeted mode cannot land in the wrong window anymore.** The ledger
+  remembers the target's process and window class and re-checks them before every
+  repeat and key-up. Before, only "is this still a window?" was checked, so after
+  the target closed, a window that inherited the same handle value could receive
+  repeats — and a key-up it never saw a key-down for.
+- **The diagnostic tool `probe_device.exe` tells the truth**: it prints the
+  interface line again (a failed query used to be swallowed and the endpoint loop
+  then ran over a garbage count), reads the HID report length only from a
+  complete 9-byte descriptor, reports an over-long device path instead of passing
+  an uninitialised buffer to Windows, and returns a non-zero code when probing
+  failed instead of always reporting success.
+- **Dashboard feedback and safety**: a failed request always shows a message now
+  (previously about twenty actions failed silently), live updates compare the
+  state revision correctly (a string was being compared with a number, so the
+  deduplication never worked), the Help screen no longer leaves background polls
+  running, and returning the keyboard to the standard driver asks for
+  confirmation before doing it.
+- **Dead code removed**: an unused tray-icon variable that had been in the source
+  since 0.9.x.
+
+## Changed
+
+- **The unused Task Scheduler startup module is gone** (`src/startup_manager.*`
+  and its test suite — it was never linked into `sidekick.exe`). Autostart in the
+  shipped build is the Startup-folder shortcut, verified end-to-end: enabling
+  creates the shortcut, `GET /api/v1/startup` reports it, disabling removes it.
+  Test suites: 15.
 
 ## Added
 
-- **Compiler warning gate** — `src/build.bat --check-warnings` checks all 12
-  translation units and fails on any warning or error; the same flags are enabled
-  in the normal build and in the test suite, with a dedicated CI step. The
-  absence of such a check is exactly what let three defects (including the
-  non-working `;` key) reach a release.
-- **Tests:** 16 suites (new: `report_diff` for HID report edge detection, and
-  `mingw_threading` for the threading shim) and 58 HTTP checks against a live
-  server.
+- **A second static-analysis gate** — `src/build.bat --check-msvc` runs MSVC's
+  `cl /analyze` over the same translation units (reviewed and accepted codes are
+  suppressed explicitly) and is part of CI next to the GCC warning gate.
+- **The warning gate now compiles for real.** It used to run with
+  `-fsyntax-only`, which never reaches the pass that reports unused file-scope
+  variables — exactly how the dead variable above survived into a release. A
+  deliberate unused variable now makes the gate fail (verified).
+- **Release notes are kept in sync with the published release page** — a workflow
+  updates the body of the published release from `RELEASE-NOTES-template.md` when
+  that file changes, because the release action only refreshes assets on re-runs.
 
 ## Install
 

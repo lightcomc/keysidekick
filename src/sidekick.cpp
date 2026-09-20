@@ -2045,6 +2045,38 @@ static WindowKey WindowKeyFromHeld(const keysidekick::TargetedKey& held) {
     return key;
 }
 
+// Идентичность окна (pid + класс) в текущий момент. false — окно уже
+// уничтожено либо класс не читается, то есть опознать его нельзя.
+static bool CaptureWindowIdentity(HWND target,
+                                 std::uint32_t* processId,
+                                 std::uint64_t* classHash) {
+    if (!target || !IsWindow(target)) return false;
+
+    DWORD pid = 0;
+    if (GetWindowThreadProcessId(target, &pid) == 0 || pid == 0) return false;
+
+    char className[256] = {0};
+    if (GetClassNameA(target, className, sizeof(className)) == 0) return false;
+
+    *processId = static_cast<std::uint32_t>(pid);
+    *classHash = keysidekick::WindowClassHash(className);
+    return true;
+}
+
+// Перед отложенной отправкой (repeat/key-up) сверяем окно с захваченным:
+// IsWindow() внутри PostWindowKey ловит только уничтоженный дескриптор, но не
+// его переиспользование — а постороннему окну с тем же значением HWND
+// отправлять клавиши нельзя.
+static bool TargetIdentityStillValid(const keysidekick::TargetedKey& held) {
+    std::uint32_t processId = 0;
+    std::uint64_t classHash = 0;
+    if (!CaptureWindowIdentity(reinterpret_cast<HWND>(held.target),
+                              &processId, &classHash)) {
+        return false;
+    }
+    return keysidekick::WindowIdentityMatches(held, processId, classHash);
+}
+
 static void ScheduleTargetedRepeatTimer() {
     if (!g_hMsgWindow) return;
     KillTimer(g_hMsgWindow, TARGETED_REPEAT_TIMER_ID);
@@ -2073,6 +2105,16 @@ static void DispatchTargetedRepeats() {
     LeaveCriticalSection(&g_csLedger);
     for (std::vector<keysidekick::TargetedKey>::const_iterator held = due.begin();
          held != due.end(); ++held) {
+        if (!TargetIdentityStillValid(*held)) {
+            // Дескриптор переиспользован или окно мертво: снимаем клавишу с
+            // учёта, чтобы не долбить повторами чужое окно.
+            EnterCriticalSection(&g_csLedger);
+            g_targetedKeys.recordUp(held->usageId, NULL);
+            LeaveCriticalSection(&g_csLedger);
+            Log("Targeted repeat dropped: target handle was recycled for usage 0x%02X",
+                held->usageId);
+            continue;
+        }
         HWND target = reinterpret_cast<HWND>(held->target);
         if (PostWindowKey(target, WindowKeyFromHeld(*held),
                           keysidekick::TargetedMessageState::RepeatDown)) {
@@ -2088,11 +2130,18 @@ static void DispatchTargetedRepeats() {
 }
 
 static void ReleaseTargetedUsage(int usageId) {
-    keysidekick::TargetedKey held = {0, 0, 0, 0, false, 0, 0};
+    keysidekick::TargetedKey held = {0, 0, 0, 0, false, 0, 0, 0, 0};
     EnterCriticalSection(&g_csLedger);
     const bool known = g_targetedKeys.recordUp(usageId, &held);
     LeaveCriticalSection(&g_csLedger);
     if (!known) return;
+
+    if (!TargetIdentityStillValid(held)) {
+        Log("Targeted key-up dropped: target handle was recycled for usage 0x%02X",
+            usageId);
+        ScheduleTargetedRepeatTimer();
+        return;
+    }
 
     HWND target = reinterpret_cast<HWND>(held.target);
     if (!PostWindowKey(target, WindowKeyFromHeld(held),
@@ -2109,6 +2158,11 @@ static void ReleaseAllTargetedKeys() {
     LeaveCriticalSection(&g_csLedger);
     for (std::vector<keysidekick::TargetedKey>::const_iterator key = held.begin();
          key != held.end(); ++key) {
+        if (!TargetIdentityStillValid(*key)) {
+            Log("Targeted key-up dropped: target handle was recycled for usage 0x%02X",
+                key->usageId);
+            continue;
+        }
         HWND target = reinterpret_cast<HWND>(key->target);
         PostWindowKey(target, WindowKeyFromHeld(*key),
                       keysidekick::TargetedMessageState::KeyUp);
@@ -2132,6 +2186,13 @@ static bool SendHoldableKeyToTarget(const Profile& prof,
         // который при отсутствии окна один раз выполнит AutoStart-запуск.
         return false;
     }
+    // Идентичность берём до отправки key-down: если окно не опознать, вести
+    // учёт удержания нельзя — repeat/key-up потом нечем будет проверить.
+    std::uint32_t targetProcessId = 0;
+    std::uint64_t targetClassHash = 0;
+    if (!CaptureWindowIdentity(target, &targetProcessId, &targetClassHash)) {
+        return false;   // тот же fallback-путь, что и при отсутствии окна
+    }
     if (!PostWindowKey(target, single,
                        keysidekick::TargetedMessageState::InitialDown)) {
         Log("Targeted key-down failed for %s usage 0x%02X",
@@ -2146,7 +2207,9 @@ static bool SendHoldableKeyToTarget(const Profile& prof,
         static_cast<std::uint16_t>(single.scanCode),
         single.extended,
         GetTickCount64() + g_targetedRepeatDelayMs,
-        g_targetedRepeatIntervalMs
+        g_targetedRepeatIntervalMs,
+        targetProcessId,
+        targetClassHash
     };
     EnterCriticalSection(&g_csLedger);
     const bool recorded = g_targetedKeys.recordDown(held);

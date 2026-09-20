@@ -21,7 +21,21 @@ struct TargetedKey {
     bool extended;
     std::uint64_t nextRepeatAtMs;
     std::uint32_t repeatIntervalMs;
+    // Идентичность окна на момент захвата. HWND Windows переиспользует сразу
+    // после DestroyWindow, поэтому одного target недостаточно: отложенный
+    // repeat или key-up мог бы уйти чужому окну, унаследовавшему значение
+    // дескриптора. pid+класс берутся при постановке на учёт и сверяются
+    // перед каждой отправкой.
+    std::uint32_t processId;
+    std::uint64_t classHash;
 };
+
+// Совпадает ли идентичность окна с захваченной (оба поля обязаны совпасть).
+inline bool WindowIdentityMatches(const TargetedKey& key,
+                                  std::uint32_t processId,
+                                  std::uint64_t classHash) {
+    return key.processId == processId && key.classHash == classHash;
+}
 
 class TargetedInputLedger {
 public:
@@ -39,6 +53,9 @@ public:
 private:
     std::vector<TargetedKey> heldKeys_;
 };
+
+// FNV-1a 64 по ANSI-имени класса окна (NULL/пустая строка → базовое смещение).
+std::uint64_t WindowClassHash(const char* className);
 
 std::uint32_t KeyboardRepeatDelayMs(unsigned int setting);
 std::uint32_t KeyboardRepeatIntervalMs(unsigned int setting);
