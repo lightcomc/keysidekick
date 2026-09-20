@@ -56,7 +56,7 @@ if /I "%~1"=="--check-warnings" (
   REM заданная внутри блока в скобках, раскрылась бы здесь пустой строкой.
   if exist "%~dp0warnings.log" del "%~dp0warnings.log"
   for %%F in (%SRCS% probe_device.cpp) do (
-    "%GXX%" -O2 -fno-strict-aliasing -D_WIN32_WINNT=0x0600 %WARNFLAGS% -fsyntax-only "%%F" >> "%~dp0warnings.log" 2>&1
+    "%GXX%" -O2 -fno-strict-aliasing -D_WIN32_WINNT=0x0600 %WARNFLAGS% -c -o "%TEMP%\ks_gate.obj" "%%F" >> "%~dp0warnings.log" 2>&1
     if errorlevel 1 echo GATE_COMPILE_FAILED %%F>>"%~dp0warnings.log"
   )
   if not exist "%~dp0warnings.log" (
@@ -102,6 +102,12 @@ if /I "%~1"=="--check-warnings" (
   echo Warning gate OK — no warnings in 12 translation units.
   exit /b 0
 )
+if /I "%~1"=="--check-msvc" (
+  call :check_msvc
+  if errorlevel 1 exit /b 1
+  exit /b 0
+)
+
 powershell -NoProfile -ExecutionPolicy Bypass -File "%DASHBOARD_GENERATOR%"
 if errorlevel 1 (
   echo Dashboard generation FAILED.
@@ -137,3 +143,62 @@ echo.
 echo === Build OK ===
 echo Copy config.example.ini to config.ini and edit it before running.
 endlocal
+exit /b 0
+
+REM =====================================================================
+REM  MSVC analyzer gate: cl /analyze over the same TU list as the product
+REM  (%SRCS%) without linking. Reviewed-and-accepted codes are suppressed
+REM  explicitly (/wd6246 shadowing, /wd6262 stack size), so a NEW analyzer
+REM  finding (C6001 uninitialised, C6011 null-deref, C6386 buffer overrun,
+REM  C6387 null argument, ...) fails the gate. Skipped with exit 0 when Visual
+REM  Studio is not installed — the gate is required in CI (windows-latest ships
+REM  VS) and optional on machines without it.
+REM =====================================================================
+:check_msvc
+setlocal EnableExtensions
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" (
+  echo MSVC analyzer skipped: vswhere not found.
+  exit /b 0
+)
+set "VSPATH="
+for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%I"
+if not defined VSPATH (
+  echo MSVC analyzer skipped: no Visual Studio C++ toolset installed.
+  exit /b 0
+)
+echo === MSVC analyzer gate: cl /analyze ===
+call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+if errorlevel 1 (
+  echo MSVC analyzer FAILED: vcvars64.bat returned an error.
+  exit /b 1
+)
+if not exist "%TEMP%\ks_msvc" mkdir "%TEMP%\ks_msvc"
+if exist "%TEMP%\ks_msvc.log" del "%TEMP%\ks_msvc.log"
+for %%F in (%SRCS% probe_device.cpp) do (
+  cl /nologo /c /analyze /std:c++14 /EHsc /D_WIN32_WINNT=0x0600 /DNOMINMAX /wd6246 /wd6262 /Fo"%TEMP%\ks_msvc\\" "%%F" >> "%TEMP%\ks_msvc.log" 2>&1
+  if errorlevel 1 echo MSVC_COMPILE_FAILED %%F>>"%TEMP%\ks_msvc.log"
+)
+if not exist "%TEMP%\ks_msvc.log" (
+  echo MSVC analyzer FAILED: no compiler output at all.
+  exit /b 1
+)
+findstr /C:"MSVC_COMPILE_FAILED" "%TEMP%\ks_msvc.log" >nul
+if not errorlevel 1 (
+  echo MSVC compilation failed for:
+  findstr /C:"MSVC_COMPILE_FAILED" "%TEMP%\ks_msvc.log"
+  findstr /C:"error C" "%TEMP%\ks_msvc.log"
+  exit /b 1
+)
+findstr /R /C:"warning C6[0-9][0-9][0-9]" "%TEMP%\ks_msvc.log" >nul
+if errorlevel 2 (
+  echo MSVC analyzer FAILED: cannot read the log.
+  exit /b 1
+)
+if not errorlevel 1 (
+  echo MSVC analyzer findings:
+  findstr /R /C:"warning C6[0-9][0-9][0-9]" "%TEMP%\ks_msvc.log"
+  exit /b 1
+)
+echo MSVC analyzer OK — no new findings in 12 translation units.
+exit /b 0

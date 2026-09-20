@@ -58,6 +58,17 @@ jobs:
           try { cmd /c build.bat --check-warnings } finally { Pop-Location }
           if ($LASTEXITCODE -ne 0) { throw "warning gate failed: see the listed warnings above" }
 
+      # Второй гейт, другим анализатором: MSVC /analyze ловит то, чего не видит
+      # gcc (неинициализированное чтение, null-аргументы, переполнение буфера).
+      # Идёт после сборки по той же причине, что и гейт предупреждений:
+      # sidekick.cpp включает генерируемый dashboard_embedded.generated.h.
+      - name: MSVC analyzer gate (cl /analyze over the same translation units)
+        shell: powershell
+        run: |
+          Push-Location src
+          try { cmd /c build.bat --check-msvc } finally { Pop-Location }
+          if ($LASTEXITCODE -ne 0) { throw "MSVC analyzer gate failed: see the listed findings above" }
+
       # No staleness gate here: build.bat always regenerates
       # src/dashboard_embedded.generated.h from web/ sources on every build, so a
       # "verify embedded dashboard is up to date" step in CI is vacuous — the

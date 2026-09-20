@@ -2013,7 +2013,8 @@ static HMENU g_trayMenu = NULL;
 static std::string g_lastAutoSwitchCheck;   // last checked foreground process
 static HWND g_lastAutoSwitchHwnd = NULL;    // idle-guard: то же окно — ничего не делаем
 static bool g_autoSwitchEnabled = true;    // auto-switch on foreground change (enabled by default)
-static HICON g_trayIcon = NULL;
+// (g_trayIcon здесь был объявлен и никогда не использовался — мёртвая переменная
+//  с 0.9.x: UpdateTray создаёт иконку через NOTIFYICONDATAW.hIcon.)
 
 static void UpdateTray();   // forward
 
