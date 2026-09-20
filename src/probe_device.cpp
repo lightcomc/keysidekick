@@ -35,10 +35,15 @@ DEFINE_GUID(GUID_DEVINTERFACE_LIBUSB0,
 DEFINE_GUID(GUID_DEVINTERFACE_TARGET_WINUSB,
     0x901A2603, 0xA95E, 0x4CA8, 0x86, 0xBF, 0xFB, 0x05, 0x47, 0xC0, 0x6B, 0x64);
 
-void ProbeDevice(const char* devicePath);  // forward declaration
+bool ProbeDevice(const char* devicePath);  // forward declaration; false = probe failed
 
 // Optional lowercase "vid_xxxx&pid_yyyy" filter. Empty = probe ALL WinUSB devices.
 static char g_vidPidFilter[64] = {0};
+
+// Счётчики для кода возврата: сколько устройств совпало с фильтром и сколько из
+// них не удалось опросить (не открылось или не инициализировался WinUSB).
+static int g_matchedCount = 0;
+static int g_probeFailedCount = 0;
 
 void PrintErr(const char* where) {
     DWORD e = GetLastError();
@@ -98,7 +103,8 @@ bool FindAndProbe() {
 
             if (isTarget) {
                 foundAny = true;
-                ProbeDevice(pDetail->DevicePath);
+                g_matchedCount++;
+                if (!ProbeDevice(pDetail->DevicePath)) g_probeFailedCount++;
             }
             delete[] buf;
         }
@@ -108,12 +114,17 @@ bool FindAndProbe() {
     return foundAny;
 }
 
-void ProbeDevice(const char* devicePath) {
+bool ProbeDevice(const char* devicePath) {
     printf("\n--- Probing target device ---\n");
 
-    // Convert path to wide
+    // Convert path to wide. Результат проверяем: при слишком длинном пути
+    // конвертация не выполняется, и CreateFileW ушёл бы с неинициализированным
+    // буфером вместо внятной ошибки.
     wchar_t wpath[1024];
-    MultiByteToWideChar(CP_ACP, 0, devicePath, -1, wpath, 1024);
+    if (MultiByteToWideChar(CP_ACP, 0, devicePath, -1, wpath, 1024) == 0) {
+        PrintErr("MultiByteToWideChar (device path too long?)");
+        return false;
+    }
 
     HANDLE hDevice = CreateFileW(wpath,
         GENERIC_READ | GENERIC_WRITE,
@@ -127,7 +138,7 @@ void ProbeDevice(const char* devicePath) {
             NULL, OPEN_EXISTING, 0, NULL);
         if (hDevice == INVALID_HANDLE_VALUE) {
             PrintErr("CreateFile (read-only)");
-            return;
+            return false;
         }
         printf("  (opened read-only)\n");
     }
@@ -136,15 +147,20 @@ void ProbeDevice(const char* devicePath) {
     if (!WinUsb_Initialize(hDevice, &hWinUsb)) {
         PrintErr("WinUsb_Initialize (device NOT on the WinUSB driver?)");
         CloseHandle(hDevice);
-        return;
+        return false;
     }
     printf("  WinUSB initialized OK\n");
 
-    // Query interface settings (first setting)
-    USB_INTERFACE_DESCRIPTOR ifDesc;
+    // Query interface settings (first setting).
+    // Структура обнулена: при ошибке запроса bNumEndpoints остаётся 0, поэтому
+    // цикл ниже не пойдёт по мусорному счётчику. Раньше ошибка игнорировалась —
+    // и строка интерфейса, ради которой утилита и запускается, молча пропадала.
+    USB_INTERFACE_DESCRIPTOR ifDesc = {0};
     if (WinUsb_QueryInterfaceSettings(hWinUsb, 0, &ifDesc)) {
         printf("  Interface: bInterfaceClass=0x%02X bInterfaceSubClass=0x%02X bNumEndpoints=%u\n",
             ifDesc.bInterfaceClass, ifDesc.bInterfaceSubClass, ifDesc.bNumEndpoints);
+    } else {
+        PrintErr("WinUsb_QueryInterfaceSettings (endpoints unknown, pipe scan skipped)");
     }
 
     // Query pipes
@@ -179,8 +195,10 @@ void ProbeDevice(const char* devicePath) {
         printf("    HID descriptor (%lu bytes):", transferred);
         for (ULONG i = 0; i < transferred; i++) printf(" %02X", hidDescBuf[i]);
         printf("\n");
-        // The HID descriptor reveals the report descriptor length
-        if (transferred >= 7) {
+        // The HID descriptor reveals the report descriptor length.
+        // wDescriptorLength лежит в байтах 7-8, поэтому короткий трансфер в 7-8
+        // байт не содержит его целиком — длину из неотправленных байтов не берём.
+        if (transferred >= 9) {
             USHORT reportDescLen = hidDescBuf[7] | (hidDescBuf[8] << 8);
             printf("    HID descriptor bcdHID=%02X%02X reportDescLen=%u\n",
                 hidDescBuf[3], hidDescBuf[2], reportDescLen);
@@ -212,6 +230,7 @@ void ProbeDevice(const char* devicePath) {
 
     WinUsb_Free(hWinUsb);
     CloseHandle(hDevice);
+    return true;
 }
 
 int main(int argc, char* argv[]) {
@@ -245,6 +264,16 @@ int main(int argc, char* argv[]) {
         printf("  3. The device is disconnected\n");
         return 1;
     }
+
+    // Код возврата должен отражать результат опроса, а не только факт находки:
+    // иначе вызывающий скрипт считает успехом случай, когда ни одно устройство
+    // открыть не удалось.
+    if (g_probeFailedCount > 0) {
+        printf("\n*** %d of %d matched device(s) failed to probe. ***\n",
+            g_probeFailedCount, g_matchedCount);
+        if (g_probeFailedCount == g_matchedCount) return 2;
+    }
+
     printf("\n=== Probe complete ===\n");
     return 0;
 }

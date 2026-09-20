@@ -193,6 +193,35 @@ void deleteActiveFallsBackAndRejectsIncomingReferences() {
     CHECK(testName, model.findProfile("profile.active") == 0);
 }
 
+void deleteRejectsPassThroughCarrierReferences() {
+    const char* testName = "delete rejects pass-through carrier references";
+    DomainModel model;
+    ProfileService service(model);
+    service.createProfile("profile.a", "Alpha", ProfileMode::Normal);
+    service.createProfile("profile.b", "Bravo", ProfileMode::Targeted);
+    service.createProfile("profile.c", "Charlie", ProfileMode::Targeted);
+
+    Profile& owner = model.profileById("profile.a");
+    // carrier-строка ссылается на profile.b по id (регистр не важен)
+    Action byId = Action::sendKey(0x04);
+    byId.profileId = "!switch:PROFILE.B";
+    owner.mappings.push_back(makeMapping(
+        "mapping.carrier.id", 1, Destination::defaultApplication(), byId));
+    // carrier-строка ссылается на profile.b по имени (пробелы обрезаются)
+    Action byName = Action::sendKey(0x05);
+    byName.profileId = "!toggle: Bravo ";
+    owner.mappings.push_back(makeMapping(
+        "mapping.carrier.name", 2, Destination::defaultApplication(), byName));
+
+    checkThrows<ReferencedProfileError>(testName, [&service]() {
+        service.deleteProfile("profile.b");
+    });
+    CHECK(testName, model.findProfile("profile.b") != 0);
+
+    service.deleteProfile("profile.c");
+    CHECK(testName, model.findProfile("profile.c") == 0);
+}
+
 void builtInNormalIsProtected() {
     const char* testName = "built-in normal is protected";
     DomainModel model;
@@ -284,6 +313,7 @@ int main() {
     duplicateIsIndependentAndGetsFreshStableIds();
     renameKeepsIdAndProfileReferencesStable();
     deleteActiveFallsBackAndRejectsIncomingReferences();
+    deleteRejectsPassThroughCarrierReferences();
     builtInNormalIsProtected();
     linkAndUnlinkMaintainDefaultsAndDestinations();
     validationReportsDuplicateIdsAndInvalidReferences();

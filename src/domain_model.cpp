@@ -26,6 +26,20 @@ bool isBlank(const std::string& value) {
     return true;
 }
 
+std::string trimWhitespace(const std::string& value) {
+    std::size_t begin = 0;
+    std::size_t end = value.size();
+    while (begin < end &&
+           std::isspace(static_cast<unsigned char>(value[begin]))) {
+        ++begin;
+    }
+    while (end > begin &&
+           std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
+    }
+    return value.substr(begin, end - begin);
+}
+
 bool containsId(const std::vector<std::string>& ids, const std::string& id) {
     for (std::size_t index = 0; index < ids.size(); ++index) {
         if (equalsCaseInsensitive(ids[index], id)) {
@@ -117,19 +131,53 @@ void validateAction(const Action& action,
     }
 }
 
+bool matchesProfileReference(const std::string& candidate,
+                             const Profile& profile) {
+    if (candidate.empty()) {
+        return false;
+    }
+    if (equalsCaseInsensitive(candidate, profile.id())) {
+        return true;
+    }
+    return !profile.name.empty() &&
+           equalsCaseInsensitive(candidate, profile.name);
+}
+
+// Pass-through carrier: config-слой хранит исходную строку действия в
+// Action::profileId (см. config_domain_bridge.cpp), поэтому строки
+// "!switch:<target>" и "!toggle:<target>" тоже ссылаются на профиль.
+bool carrierReferencesProfile(const std::string& carrier,
+                              const Profile& profile) {
+    static const char* const prefixes[] = {"!switch:", "!toggle:"};
+    for (std::size_t index = 0;
+         index < sizeof(prefixes) / sizeof(prefixes[0]); ++index) {
+        const std::string prefix(prefixes[index]);
+        if (carrier.size() >= prefix.size() &&
+            carrier.compare(0, prefix.size(), prefix) == 0 &&
+            matchesProfileReference(
+                trimWhitespace(carrier.substr(prefix.size())), profile)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool actionReferencesProfile(const Action& action,
-                             const std::string& profileId) {
+                             const Profile& profile) {
     if (action.type == ActionType::SwitchProfile &&
-        equalsCaseInsensitive(action.profileId, profileId)) {
+        matchesProfileReference(action.profileId, profile)) {
         return true;
     }
     if (action.type == ActionType::ToggleProfile &&
-        (equalsCaseInsensitive(action.profileId, profileId) ||
-         equalsCaseInsensitive(action.secondaryProfileId, profileId))) {
+        (matchesProfileReference(action.profileId, profile) ||
+         matchesProfileReference(action.secondaryProfileId, profile))) {
+        return true;
+    }
+    if (carrierReferencesProfile(action.profileId, profile)) {
         return true;
     }
     for (std::size_t index = 0; index < action.steps.size(); ++index) {
-        if (actionReferencesProfile(action.steps[index], profileId)) {
+        if (actionReferencesProfile(action.steps[index], profile)) {
             return true;
         }
     }
@@ -724,7 +772,7 @@ void ProfileService::deleteProfile(const std::string& profileId) {
         for (std::size_t mappingIndex = 0;
              mappingIndex < owner.mappings.size(); ++mappingIndex) {
             if (actionReferencesProfile(owner.mappings[mappingIndex].action,
-                                        profile.id())) {
+                                        profile)) {
                 throw ReferencedProfileError(
                     "profile is referenced by mapping: " +
                     owner.mappings[mappingIndex].id());
