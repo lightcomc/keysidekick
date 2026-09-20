@@ -159,12 +159,20 @@ setlocal EnableExtensions
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" (
   echo MSVC analyzer skipped: vswhere not found.
+  if defined GITHUB_ACTIONS (
+    echo MSVC analyzer gate FAILED: the CI image must provide Visual Studio — a gate that silently disappears must not pass.
+    exit /b 1
+  )
   exit /b 0
 )
 set "VSPATH="
 for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%I"
 if not defined VSPATH (
   echo MSVC analyzer skipped: no Visual Studio C++ toolset installed.
+  if defined GITHUB_ACTIONS (
+    echo MSVC analyzer gate FAILED: the CI image must provide the MSVC C++ toolset.
+    exit /b 1
+  )
   exit /b 0
 )
 echo === MSVC analyzer gate: cl /analyze ===
@@ -173,31 +181,31 @@ if errorlevel 1 (
   echo MSVC analyzer FAILED: vcvars64.bat returned an error.
   exit /b 1
 )
-if not exist "%TEMP%\ks_msvc" mkdir "%TEMP%\ks_msvc"
-if exist "%TEMP%\ks_msvc.log" del "%TEMP%\ks_msvc.log"
+set "ANADIR=%TEMP%\ks_msvc_%RANDOM%"
+mkdir "%ANADIR%"
 for %%F in (%SRCS% probe_device.cpp) do (
-  cl /nologo /c /analyze /std:c++14 /EHsc /D_WIN32_WINNT=0x0600 /DNOMINMAX /wd6246 /wd6262 /Fo"%TEMP%\ks_msvc\\" "%%F" >> "%TEMP%\ks_msvc.log" 2>&1
-  if errorlevel 1 echo MSVC_COMPILE_FAILED %%F>>"%TEMP%\ks_msvc.log"
+  cl /nologo /c /analyze /std:c++14 /EHsc /D_WIN32_WINNT=0x0600 /DNOMINMAX /wd6246 /wd6262 /Fo"%ANADIR%\\" "%%F" >> "%ANADIR%\msvc.log" 2>&1
+  if errorlevel 1 echo MSVC_COMPILE_FAILED %%F>>"%ANADIR%\msvc.log"
 )
-if not exist "%TEMP%\ks_msvc.log" (
+if not exist "%ANADIR%\msvc.log" (
   echo MSVC analyzer FAILED: no compiler output at all.
   exit /b 1
 )
-findstr /C:"MSVC_COMPILE_FAILED" "%TEMP%\ks_msvc.log" >nul
+findstr /C:"MSVC_COMPILE_FAILED" "%ANADIR%\msvc.log" >nul
 if not errorlevel 1 (
   echo MSVC compilation failed for:
-  findstr /C:"MSVC_COMPILE_FAILED" "%TEMP%\ks_msvc.log"
-  findstr /C:"error C" "%TEMP%\ks_msvc.log"
+  findstr /C:"MSVC_COMPILE_FAILED" "%ANADIR%\msvc.log"
+  findstr /C:"error C" "%ANADIR%\msvc.log"
   exit /b 1
 )
-findstr /R /C:"warning C6[0-9][0-9][0-9]" "%TEMP%\ks_msvc.log" >nul
+findstr /R /C:"warning C6[0-9][0-9][0-9]" "%ANADIR%\msvc.log" >nul
 if errorlevel 2 (
-  echo MSVC analyzer FAILED: cannot read the log.
+  echo MSVC analyzer FAILED: cannot read the analyzer log.
   exit /b 1
 )
 if not errorlevel 1 (
   echo MSVC analyzer findings:
-  findstr /R /C:"warning C6[0-9][0-9][0-9]" "%TEMP%\ks_msvc.log"
+  findstr /R /C:"warning C6[0-9][0-9][0-9]" "%ANADIR%\msvc.log"
   exit /b 1
 )
 echo MSVC analyzer OK — no new findings in 12 translation units.

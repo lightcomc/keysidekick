@@ -554,7 +554,7 @@ function closeModal(){
   if(_modalPreviousFocus){try{_modalPreviousFocus.focus();}catch(e){}_modalPreviousFocus=null;}
 }
 function useWindow(cls,proc,path){closeModal();const fClass=document.getElementById('fClass');const fExe=document.getElementById('fExe');const fPath=document.getElementById('fPath');if(fClass)fClass.value=cls;if(fExe)fExe.value=proc;if(fPath)fPath.value=path;const summary=document.getElementById('targetSummaryText');if(summary)summary.textContent=proc||cls;markProfileDirty();toast('Target selected: '+(proc||cls),'success');}
-async function testResolve(){if(!sel)return;const r=await api('POST','/api/v1/applications/test-resolve',{windowClass:document.getElementById('fClass').value,processName:document.getElementById('fExe').value,processPath:document.getElementById('fPath').value});if(r.found){toast('Window found (pid='+r.pid+')','success');}else{toast('Window not found','error');}}
+async function testResolve(){if(!sel)return;const r=await api('POST','/api/v1/applications/test-resolve',{windowClass:document.getElementById('fClass').value,processName:document.getElementById('fExe').value,processPath:document.getElementById('fPath').value});if(r.found){toast('Window found (pid='+r.pid+')','success');}else{var extra=(r.unreadableMetadata>0)?(' — '+r.unreadableMetadata+' window(s) expose no process info (protected app?), so matching by process is impossible for them'):'';toast('Window not found'+extra,'error');}}
 // Pick app from running windows for multi-app target
 async function pickAppFromRunning(){
   try{

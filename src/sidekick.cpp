@@ -4512,7 +4512,15 @@ static void HandleHttpConnection(SOCKET cli) {
             resp += "\"}";
             HttpSendJson(cli, resp);
         } else {
-            HttpSendJson(cli, "{\"found\":false}");
+            // Причина отказа, а не голое «не найдено»: часть окон может не отдавать
+            // метаданные процесса (защищённые/песочные), и тогда поиск по процессу
+            // и пути для них невозможен — дашборд покажет это в сообщении.
+            std::size_t unreadable = 0;
+            for (std::size_t index = 0; index < windows.size(); ++index) {
+                if (!windows[index].processMetadataAvailable) ++unreadable;
+            }
+            HttpSendJson(cli, "{\"found\":false,\"unreadableMetadata\":" +
+                              std::to_string(unreadable) + "}");
         }
     }
     // ---- Phase 4: SSE live updates ----

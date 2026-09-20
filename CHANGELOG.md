@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **"Window not found" now says why** — the test-connection check in the dashboard reports how many top-level windows expose no process information (protected or sandboxed apps), because matching by process/path is impossible for them; the same count is logged when a targeted key cannot resolve its window.
+
+### Changed
+
+- **The MSVC analyzer gate cannot silently disappear** — `src/build.bat --check-msvc` now fails when it runs under CI (where the toolset is guaranteed) and no Visual Studio is found, instead of skipping; a local run without VS still skips with exit 0. Its temporary files are per-run, so two gate runs no longer collide.
+
 ## [0.9.8] - 2026-09-20
 
 Follow-up to the 0.9.7 audit: removes the last dead module, closes two defects
