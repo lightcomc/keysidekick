@@ -64,7 +64,7 @@ jobs:
       # generated header is gitignored and absent on a fresh checkout.
       # build.bat --check-dashboard remains a local pre-commit lint.
 
-      - name: Unit tests (14 suites)
+      - name: Unit tests
         shell: msys2 {0}
         run: |
           set -e
