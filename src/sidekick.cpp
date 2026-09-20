@@ -77,7 +77,7 @@ static const char* CONFIG_FILE = "config.ini";
 static const char* LOG_FILE    = "sidekick.log";
 
 // Product version — single source of truth (mirrored in resources.rc VERSIONINFO).
-static const char* APP_VERSION = "0.9.7";
+static const char* APP_VERSION = "0.9.8";
 
 // ---- Data path resolution ----
 // config.ini and sidekick.log resolve with fallback order:
@@ -202,6 +202,9 @@ static keysidekick::config::GeneralSettings g_configGeneral;
 // умеет писать обратно, но мост в domain о них не знает — раньше они молча
 // исчезали при первом сохранении из дашборда.
 static std::vector<keysidekick::config::Extension> g_configExtensions;
+// Прочитался ли config.ini при последней загрузке: нужен, чтобы POST /api/reload
+// отвечал честно (раньше всегда «ok», даже когда файл не читался, BA-34).
+static bool g_configReadOk = false;
 
 // ---- Phase 4: Security + live state ----
 // CSRF token: генерируется при старте, embedded в dashboard HTML, проверяется на mutating POST.
@@ -976,6 +979,21 @@ static HWND FindTargetWindowScored(const std::string& windowClass,
     keysidekick::windows_targets::WindowCandidate resolved;
     if (keysidekick::windows_targets::ResolveTarget(windows, query, &resolved, policy)) {
         return (HWND)resolved.handle;
+    }
+    // Почему не нашли: при поиске по процессу/пути часть окон может не отдавать
+    // метаданные (защищённые или песочные процессы) — без этого «окно не
+    // найдено» в логе выглядит беспричинно (BA-26). Логируем только на отказе,
+    // чтобы не спамить на каждое нажатие.
+    if (!processName.empty() || !processPath.empty()) {
+        std::size_t unreadable = 0;
+        for (std::size_t index = 0; index < windows.size(); ++index) {
+            if (!windows[index].processMetadataAvailable) ++unreadable;
+        }
+        if (unreadable > 0) {
+            Log("Target search failed: %zu of %zu top-level windows expose no process metadata "
+                "(protected or sandboxed process?), class='%s' exe='%s'",
+                unreadable, windows.size(), windowClass.c_str(), processName.c_str());
+        }
     }
     return NULL;
 }
@@ -2639,7 +2657,13 @@ static LRESULT CALLBACK MsgWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 leaveLock = false;                 // ReloadConfig берёт лок сам
                 LeaveCriticalSection(&g_csProfile);
                 ReloadConfig();
-                op->success = true;
+                // Честный результат: если файл не прочитался, «ok» вводил в
+                // заблуждение — пользователь видел успех и пустой список профилей.
+                op->success = g_configReadOk;
+                if (!op->success) {
+                    snprintf(op->error, sizeof(op->error),
+                             "config.ini could not be read — running on defaults");
+                }
                 break;                             // M4: общий epilogue — cleanup при timeout
             // ---- Mapping management (in-place edit, reorder, duplicate) ----
             case DASH_UPDATE_KEY: {
@@ -4020,7 +4044,9 @@ static void HandleHttpConnection(SOCKET cli) {
         op->op = DASH_RELOAD;
         DashOpResult rr = RunDashOp(op);
         if (rr.callerOwnsOp) delete op;
-        HttpSendJson(cli, rr.ok ? "{\"ok\":true}" : "{\"error\":\"reload failed\"}", rr.ok ? 200 : 500);
+        HttpSendJson(cli, rr.ok ? "{\"ok\":true}"
+                               : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}"),
+                   rr.ok ? 200 : 500);
     }
     // ---- Phase 2: multi-app CRUD endpoints (additive, no changes to existing) ----
     // GET /api/v1/applications — список ApplicationTargets
@@ -4406,7 +4432,9 @@ static void HandleHttpConnection(SOCKET cli) {
                 op->op = DASH_RELOAD;
                 DashOpResult rr = RunDashOp(op);
                 if (rr.callerOwnsOp) delete op;
-                HttpSendJson(cli, rr.ok ? "{\"ok\":true}" : "{\"error\":\"reload failed\"}", rr.ok ? 200 : 500);
+                HttpSendJson(cli, rr.ok ? "{\"ok\":true}"
+                                       : (std::string("{\"error\":\"") + JsonEscape(rr.error) + "\"}"),
+                           rr.ok ? 200 : 500);
             }
         }
     }
@@ -5387,7 +5415,28 @@ static void ApplyGeneralSettings(const keysidekick::config::GeneralSettings& gs)
 //  LoadConfig (Phase 2) — config_v3 Parse → bridge → g_domain → projection.
 //  Safety gate: если config_v3 вернул ERROR diagnostic → fallback на legacy.
 // =====================================================================
+// Частая причина «конфиг не читается» — файл сохранён в UTF-16. Говорим об этом
+// прямо: иначе сообщение «cannot read» не подсказывает пользователю, что делать
+// (BA-30, остаток). Вызывается только на путях отказа, поэтому дешёвое чтение
+// первых байт здесь уместно.
+static void LogConfigEncodingHint(const std::wstring& path) {
+    FILE* probe = _wfopen(path.c_str(), L"rb");
+    if (!probe) return;
+    unsigned char head[4] = {0};
+    const std::size_t got = fread(head, 1, sizeof(head), probe);
+    fclose(probe);
+    if (got >= 2 &&
+        ((head[0] == 0xFF && head[1] == 0xFE) || (head[0] == 0xFE && head[1] == 0xFF))) {
+        Log("  hint: %s starts with a UTF-16 BOM — re-save it as UTF-8 (Notepad: Encoding -> UTF-8)",
+            CONFIG_FILE);
+    } else if (got >= 2 && head[0] != 0 && head[1] == 0) {
+        Log("  hint: %s looks like UTF-16 without a BOM (NUL bytes) — re-save it as UTF-8",
+            CONFIG_FILE);
+    }
+}
+
 static void LoadConfig() {
+    g_configReadOk = false;
     // 1. Прочитать файл через runtime_storage
     std::wstring wpath;
     int wlen = MultiByteToWideChar(CP_ACP, 0, CONFIG_FILE, -1, NULL, 0);
@@ -5399,6 +5448,7 @@ static void LoadConfig() {
     keysidekick::StorageResult readResult = keysidekick::ReadUtf8File(wpath, &fileContent);
     if (!readResult.ok()) {
         Log("LoadConfig: cannot read %s (%s) — using defaults", CONFIG_FILE, readResult.message.c_str());
+        LogConfigEncodingHint(wpath);
         // Domain обязан соответствовать runtime: иначе следующий WriteConfig
         // (SyncRuntimeToDomain) воскресит старый набор профилей поверх файла.
         g_domain = keysidekick::DomainModel();
@@ -5420,6 +5470,7 @@ static void LoadConfig() {
         }
         Log("LoadConfig: config_v3 reported %zu error(s), falling back to legacy parser",
             errorCount);
+        LogConfigEncodingHint(wpath);
         for (std::size_t i = 0; i < pr.diagnostics.size() && i < 5; ++i) {
             if (pr.diagnostics[i].severity == keysidekick::config::DIAGNOSTIC_ERROR) {
                 Log("  ERROR: %s", pr.diagnostics[i].message.c_str());
@@ -5431,6 +5482,10 @@ static void LoadConfig() {
         g_configExtensions.clear();   // legacy-формат extension-строк не хранит
         EnsureBuiltinBasic();
         LoadConfigLegacy();
+        // Файл не применён: мы на дефолтах, и /api/reload обязан об этом сказать,
+        // а не отвечать «ok» (BA-34). Legacy-fallback сюда попадает именно при
+        // нераспознанном файле, а не при старом формате (тот разбирает Parse).
+        g_configReadOk = false;
         return;
     }
     // Логировать warnings (миграция и т.д.)
@@ -5451,6 +5506,7 @@ static void LoadConfig() {
     // 5. Спроецировать domain → runtime g_profiles
     ProjectDomainToRuntime();
 
+    g_configReadOk = true;
     Log("Config loaded (v3+bridge): %zu profiles, %zu apps, active=%s, http=%d tray=%d",
         g_domain.profiles.size(), g_domain.applications.size(),
         g_activeProfile.c_str(), (int)g_httpEnabled, (int)g_trayEnabled);
